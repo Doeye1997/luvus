@@ -1693,6 +1693,26 @@ mod tests {
         assert_eq!(detection.identity_source, "command_fallback");
     }
 
+    #[test]
+    fn successful_process_scan_replaces_a_stale_identity() {
+        let detection = classify(
+            Some("claude"),
+            "claude prompt",
+            false,
+            false,
+            "cmd.exe",
+            "claude",
+            &[
+                r#"cmd.exe /d /k C:\Users\me\.grok\bin\grok.exe --prompt-file C:\Users\me\task.md"#
+                    .into(),
+                r#"C:\Users\me\.grok\bin\grok.exe --prompt-file C:\Users\me\task.md"#.into(),
+            ],
+            &Manifests::builtin(),
+        );
+        assert_eq!(detection.agent, "grok");
+        assert_eq!(detection.identity_source, "process_tree");
+    }
+
     /// A pane is named after the agent *running in it*, never after a word that
     /// happens to be on screen. `amp` is a substring of "example", "sample",
     /// "stamped" and "implementation", so a Claude pane printing ordinary prose
