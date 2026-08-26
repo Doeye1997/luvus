@@ -988,13 +988,39 @@ impl Manifests {
 
     /// Split a process command line into argv-like tokens, retaining spaces
     /// inside quoted paths such as `"C:\\Program Files\\nodejs\\node.exe"`.
+    /// Apply the Windows backslash-before-quote rules so escaped quotes and
+    /// trailing backslashes survive when launch arguments are replayed.
     fn command_tokens(command: &str) -> Vec<String> {
         let mut tokens = Vec::new();
         let mut token = String::new();
         let mut quoted = false;
         let mut token_started = false;
-        for character in command.chars() {
+        let mut characters = command.chars().peekable();
+        while let Some(character) = characters.next() {
             match character {
+                '\\' => {
+                    let mut backslashes = 1;
+                    while characters.peek().copied() == Some('\\') {
+                        characters.next();
+                        backslashes += 1;
+                    }
+                    token_started = true;
+                    if characters.peek().copied() == Some('"') {
+                        characters.next();
+                        for _ in 0..backslashes / 2 {
+                            token.push('\\');
+                        }
+                        if backslashes % 2 == 1 {
+                            token.push('"');
+                        } else {
+                            quoted = !quoted;
+                        }
+                    } else {
+                        for _ in 0..backslashes {
+                            token.push('\\');
+                        }
+                    }
+                }
                 '"' => {
                     quoted = !quoted;
                     token_started = true;
@@ -1341,6 +1367,21 @@ mod tests {
         assert_eq!(
             m.launch_args_for(&[r#"claude --model "" --yes"#.into()], "claude"),
             Some(vec!["--model".into(), "".into(), "--yes".into()])
+        );
+        // Windows escapes a quote with an odd run of backslashes inside a
+        // quoted argument; the escaped quote must remain part of the value.
+        assert_eq!(
+            m.launch_args_for(
+                &["claude --append-system-prompt \"say \\\"hi\\\"\"".into()],
+                "claude",
+            ),
+            Some(vec!["--append-system-prompt".into(), "say \"hi\"".into()])
+        );
+        // An even run before a closing quote becomes half as many backslashes,
+        // and the quote remains the delimiter.
+        assert_eq!(
+            m.launch_args_for(&["claude --cwd \"C:\\work\\\\\"".into()], "claude"),
+            Some(vec!["--cwd".into(), r#"C:\work\"#.into()])
         );
         // Windows process inspection supplies the full Node command line, so
         // Pi's npm package name in the script slot resolves to the agent.
