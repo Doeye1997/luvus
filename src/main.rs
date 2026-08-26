@@ -516,7 +516,9 @@ fn ensure_server_ready(sock: &Path) -> Result<()> {
                 }
                 Ok(())
             }
-            Err(_) => recycle_unresponsive_server(sock),
+            // Connected: the pipe accepted. A slow or false IO reply is not a
+            // mute server. #144: do not kill a healthy session on a timeout.
+            Err(_) => Ok(()),
         },
         Err(error) if error.kind() == io::ErrorKind::TimedOut => recycle_unresponsive_server(sock),
         Err(_) => {
@@ -951,14 +953,13 @@ fn send_server_stop() -> Result<bool> {
     let response = match server_control_request("server.stop") {
         Ok(response) => response,
         Err(error) => {
-            // The old server may exit between the liveness probe and connect,
-            // or Windows may observe the named pipe closing before the final
-            // stop acknowledgement is readable. A completed shutdown is still
-            // success. A live, unresponsive server is force-killed.
-            if force_stop_unresponsive(pid, &client_socket).is_ok() {
+            // Stop may have already taken effect: the pipe closed before the
+            // acknowledgement was readable. Wait for the socket to vanish
+            // before force-killing, so a healthy shutdown is not interrupted.
+            if wait_for_shutdown(&client_socket).is_ok() {
                 return Ok(true);
             }
-            if wait_for_shutdown(&client_socket).is_ok() {
+            if force_stop_unresponsive(pid, &client_socket).is_ok() {
                 return Ok(true);
             }
             return Err(error);

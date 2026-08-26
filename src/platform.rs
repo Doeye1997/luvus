@@ -357,7 +357,16 @@ pub fn is_stoppable_luvus_pid(pid: u32) -> bool {
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {
-        return true;
+        let Some(info) = process_tree(pid).into_iter().next() else {
+            return false;
+        };
+        let name = info
+            .command
+            .split_whitespace()
+            .next()
+            .unwrap_or(&info.command);
+        let base = name.rsplit('/').next().unwrap_or(name);
+        return base == "luvus";
     }
     #[cfg(not(any(windows, unix)))]
     {
@@ -959,6 +968,13 @@ mod tests {
         let (cwd_only, commands) = super::scan_pane_runtime(&[pid], false);
         assert_eq!(cwd_only.len(), 1);
         assert!(commands.is_none(), "command projection is demand-driven");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_stoppable_pid_rejects_self_and_missing() {
+        assert!(!super::is_stoppable_luvus_pid(0));
+        assert!(!super::is_stoppable_luvus_pid(std::process::id()));
     }
 
     #[test]

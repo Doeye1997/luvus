@@ -436,17 +436,27 @@ pub struct ServerPidFile;
 
 impl ServerPidFile {
     pub fn claim() -> Self {
-        let path = session_dir().join("server.pid");
-        let _ = fs::write(&path, std::process::id().to_string());
+        let pid = std::process::id();
+        let mut body = pid.to_string();
+        if let Some(marker) = crate::platform::process_start_marker(pid) {
+            body.push(' ');
+            body.push_str(&marker);
+        }
+        let _ = fs::write(session_dir().join("server.pid"), body);
         Self
     }
 
     pub fn read() -> Option<u32> {
-        fs::read_to_string(session_dir().join("server.pid"))
-            .ok()?
-            .trim()
-            .parse()
-            .ok()
+        let text = fs::read_to_string(session_dir().join("server.pid")).ok()?;
+        let mut parts = text.split_whitespace();
+        let pid: u32 = parts.next()?.parse().ok()?;
+        if let Some(recorded) = parts.next() {
+            let live = crate::platform::process_start_marker(pid)?;
+            if live != recorded {
+                return None;
+            }
+        }
+        Some(pid)
     }
 }
 
@@ -683,9 +693,9 @@ fn resolve_pane_sessions(app: &App) -> HashMap<PaneId, Option<(String, String)>>
         let Some(st) = app.status.get(id) else {
             continue;
         };
-        let Some(sid) = session_id_in_commands(
-            app.proc_commands.get(id).map(Vec::as_slice).unwrap_or(&[]),
-        ) else {
+        let Some(sid) =
+            session_id_in_commands(app.proc_commands.get(id).map(Vec::as_slice).unwrap_or(&[]))
+        else {
             continue;
         };
         let agent = snapshot_agent(
@@ -1119,8 +1129,7 @@ mod session_flag_tests {
         assert_eq!(session_id_in_commands(&["pwsh.exe".into()]), None);
         assert_eq!(
             session_id_in_commands(&[
-                "node.exe pi-coding-agent --session 01a03ef7-b621-7433-bc7b-55c3a69d5408"
-                    .into(),
+                "node.exe pi-coding-agent --session 01a03ef7-b621-7433-bc7b-55c3a69d5408".into(),
             ])
             .as_deref(),
             Some("01a03ef7-b621-7433-bc7b-55c3a69d5408")
