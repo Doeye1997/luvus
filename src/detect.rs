@@ -1043,26 +1043,34 @@ impl Manifests {
         tokens
     }
 
-    /// Match an interpreter's script slot by basename or by a distinctive
-    /// package directory in its path. npm shims commonly execute `cli.js`
-    /// from a directory named after the package (`...\\pi-coding-agent\\...`).
+    /// Match an interpreter's script slot by basename or by a distinctive npm
+    /// package root. npm shims commonly execute `cli.js` from a package path
+    /// such as `...\\node_modules\\pi-coding-agent\\dist\\cli.js`.
     fn match_interpreter_script(&self, token: &str) -> Option<String> {
         self.match_binary(binary_name(token)).or_else(|| {
             let normalized = token.to_lowercase().replace('\\', "/");
-            let mut segments = normalized.split('/').rev();
-            let script = strip_script_extension(segments.next()?);
+            let segments: Vec<&str> = normalized.split('/').collect();
+            let script = strip_script_extension(segments.last().copied()?);
 
             self.agents
                 .iter()
                 .find(|agent| agent.all().any(|pattern| pattern == script))
                 .map(|agent| agent.name.clone())
                 .or_else(|| {
-                    segments.find_map(|segment| {
-                        self.agents
-                            .iter()
-                            .find(|agent| agent.distinct.iter().any(|pattern| pattern == segment))
-                            .map(|agent| agent.name.clone())
-                    })
+                    let node_modules = segments
+                        .iter()
+                        .rposition(|segment| *segment == "node_modules")?;
+                    let package_index = node_modules + 1;
+                    let package = segments.get(package_index).copied()?;
+                    let package = if package.starts_with('@') {
+                        segments.get(package_index + 1).copied()?
+                    } else {
+                        package
+                    };
+                    self.agents
+                        .iter()
+                        .find(|agent| agent.distinct.iter().any(|pattern| pattern == package))
+                        .map(|agent| agent.name.clone())
                 })
         })
     }
@@ -1396,6 +1404,24 @@ mod tests {
         assert_eq!(
             m.agent_in_processes(&[r#"node C:\tools\grok.js"#.into()]),
             Some("grok".into())
+        );
+        // A bare agent name in an unrelated project directory is not an
+        // installed package and must not identify the pane.
+        assert_eq!(
+            m.agent_in_processes(&[r#"node C:\work\claude\build.js"#.into()]),
+            None
+        );
+        // Package-directory matching remains available for npm shim paths.
+        assert_eq!(
+            m.agent_in_processes(&[r#"node C:\work\node_modules\claude\build.js"#.into()]),
+            Some("claude".into())
+        );
+        // Scoped npm packages use the package name after the `@scope` segment.
+        assert_eq!(
+            m.agent_in_processes(&[
+                r#"node C:\work\node_modules\@earendil-works\pi-coding-agent\dist\cli.js"#.into()
+            ]),
+            Some("pi".into())
         );
     }
 
