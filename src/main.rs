@@ -968,6 +968,13 @@ fn send_server_stop() -> Result<bool> {
             if wait_for_shutdown(&client_socket).is_ok() {
                 return Ok(true);
             }
+            // Client socket still accepts: server is reachable. The stop
+            // request timed out; do not kill the session.
+            if ipc::transport::connect_timeout(&client_socket, SERVER_CONTROL_TIMEOUT).is_ok() {
+                return Err(anyhow!(
+                    "luvus server is running but the control socket did not answer"
+                ));
+            }
             if force_stop_unresponsive(pid, &client_socket).is_ok() {
                 return Ok(true);
             }
