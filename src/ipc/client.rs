@@ -530,11 +530,12 @@ where
             *last_cursor = Some((x, y));
         }
     }
-    let ime = cursor.filter(|(x, y)| *x < tw && *y < th).or(*last_cursor);
+    let visible_cursor = cursor.filter(|(x, y)| *x < tw && *y < th);
+    let ime = visible_cursor.or(*last_cursor);
     match ime {
         Some((x, y)) if x < tw && y < th => {
             backend.set_cursor_position(Position::new(x, y))?;
-            if cursor.is_some() {
+            if visible_cursor.is_some() {
                 backend.show_cursor()?;
             } else {
                 backend.hide_cursor()?;
@@ -1010,6 +1011,36 @@ mod paint_tests {
         )
         .unwrap();
 
+        assert_eq!(
+            term.backend_mut().get_cursor_position().unwrap(),
+            Position::new(1, 0)
+        );
+        assert!(!term.backend().cursor_visible());
+    }
+
+    #[test]
+    fn out_of_bounds_cursor_hides_but_stays_on_last_pane_cell() {
+        let mut term = Terminal::new(TestBackend::new(8, 2)).unwrap();
+        let mut last = None;
+        let cells = vec![cell(" "); 16];
+        let f0 = FrameData {
+            width: 8,
+            height: 2,
+            cells: cells.clone(),
+            cursor: Some((1, 0)),
+        };
+        paint(
+            &mut term,
+            &super::frame_cells(&f0, true),
+            f0.cursor,
+            true,
+            &mut last,
+        )
+        .unwrap();
+
+        paint(&mut term, &[], Some((99, 99)), false, &mut last).unwrap();
+
+        assert_eq!(last, Some((1, 0)));
         assert_eq!(
             term.backend_mut().get_cursor_position().unwrap(),
             Position::new(1, 0)
