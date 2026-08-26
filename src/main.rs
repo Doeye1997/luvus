@@ -530,6 +530,10 @@ fn ensure_server_ready(sock: &Path) -> Result<()> {
 
 fn recycle_unresponsive_server(sock: &Path) -> Result<()> {
     send_server_stop()?;
+    // The old process may still own API or client pipes after stop
+    // returns. Spawning now makes the replacement see those endpoints and
+    // exit, then the old process dies — no server left.
+    wait_for_shutdown(sock)?;
     spawn_server()?;
     wait_for_socket(sock)
 }
@@ -852,12 +856,14 @@ fn server_restart(context: i18n::cli::Context) -> Result<()> {
 
 /// Poll (bounded) until the server releases its socket, so `stop`/`restart`
 /// return only once the old server is truly gone.
-fn wait_for_shutdown(sock: &Path) -> Result<()> {
+fn wait_for_shutdown(_sock: &Path) -> Result<()> {
+    let api = persist::socket_path();
+    let client = persist::client_socket_path();
     for _ in 0..50 {
-        match ipc::transport::connect_timeout(sock, Duration::from_millis(100)) {
-            Err(error) if error.kind() == io::ErrorKind::TimedOut => {}
-            Err(_) => return Ok(()),
-            Ok(_) => {}
+        if !ipc::transport::endpoint_exists(&api, Duration::from_millis(100))
+            && !ipc::transport::endpoint_exists(&client, Duration::from_millis(100))
+        {
+            return Ok(());
         }
         thread::sleep(Duration::from_millis(50));
     }
