@@ -330,6 +330,63 @@ pub fn process_belongs_to_current_user(pid: u32) -> bool {
     windows::process_belongs_to_current_user(pid)
 }
 
+/// True when `pid` is another Luvus process owned by this account.
+/// `server stop` uses this before force-killing an unresponsive server.
+pub fn is_stoppable_luvus_pid(pid: u32) -> bool {
+    if pid == 0 || pid == std::process::id() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        if !process_belongs_to_current_user(pid) {
+            return false;
+        }
+        return process_tree(pid).first().is_some_and(|info| {
+            let name = info
+                .command
+                .rsplit(['\\', '/'])
+                .next()
+                .unwrap_or(&info.command);
+            name.eq_ignore_ascii_case("luvus.exe")
+        });
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .is_ok_and(|comm| comm.trim() == "luvus");
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        return true;
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        false
+    }
+}
+
+/// End `pid` and its children. Used only after [`is_stoppable_luvus_pid`].
+pub fn force_terminate(pid: u32) {
+    #[cfg(windows)]
+    {
+        let _ = no_window(
+            std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+        )
+        .status();
+    }
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = pid;
+    }
+}
+
 /// One process running under a pane, for the "what is actually running?" overlay.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProcInfo {

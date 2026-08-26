@@ -257,7 +257,9 @@ pub fn run() -> Result<()> {
     let client_sock = persist::client_socket_path();
     // A responsive listener means another server owns this state directory.
     // Do not reclaim either socket or start a competing process.
-    if transport::connect(&sock).is_ok() || transport::connect(&client_sock).is_ok() {
+    if transport::connect_timeout(&sock, Duration::from_millis(50)).is_ok()
+        || transport::connect_timeout(&client_sock, Duration::from_millis(50)).is_ok()
+    {
         return Ok(());
     }
     let _logging = crate::logging::init(crate::logging::Role::Server);
@@ -368,6 +370,7 @@ pub fn run() -> Result<()> {
             crate::logging::Field::RestoreSkipped(0),
         ],
     );
+    let _pid_file = persist::ServerPidFile::claim();
     // The session is restored and the API socket is listening, so a module's
     // `[[startup]]` hooks can now call back in — this is where a module
     // repaints the docks it owns (docs/13 §3.7).

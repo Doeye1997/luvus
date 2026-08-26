@@ -202,6 +202,47 @@ impl Conn {
             _ => Err(error),
         }
     }
+
+    /// PID of the process that owns the listening endpoint.
+    ///
+    /// Used by `server stop` when the app loop no longer answers: the pipe or
+    /// socket can still accept connections while requests hang forever.
+    pub fn server_pid(&self) -> io::Result<u32> {
+        #[cfg(windows)]
+        {
+            let Stream::NamedPipe(pipe) = &*self.0;
+            pipe.inner().server_process_id()
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            use std::mem::{size_of, zeroed};
+            use std::os::fd::AsRawFd;
+
+            let Stream::UdSocket(socket) = &*self.0;
+            let mut credentials: libc::ucred = unsafe { zeroed() };
+            let mut len = size_of::<libc::ucred>() as libc::socklen_t;
+            let result = unsafe {
+                libc::getsockopt(
+                    socket.inner().as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_PEERCRED,
+                    (&raw mut credentials).cast(),
+                    &raw mut len,
+                )
+            };
+            if result != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(credentials.pid as u32)
+        }
+        #[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
+        {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "server pid is not available on this transport",
+            ))
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -431,6 +472,47 @@ pub(crate) fn discovery_address(path: &Path) -> String {
     }
 }
 
+/// Connect, but do not block the caller forever.
+///
+/// Windows named-pipe `connect` waits indefinitely when every instance is busy.
+/// A helper thread cannot fix that: `main` still waits for the blocked
+/// `connect` thread, so `ping` / `server stop` appear hung after the timeout.
+/// Wait on the pipe with a kernel timeout, then connect.
+pub fn connect_timeout(path: &Path, timeout: Duration) -> io::Result<Conn> {
+    #[cfg(windows)]
+    {
+        wait_for_named_pipe(path, timeout)?;
+        connect(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = timeout;
+        connect(path)
+    }
+}
+
+#[cfg(windows)]
+fn wait_for_named_pipe(path: &Path, timeout: Duration) -> io::Result<()> {
+    use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
+
+    let name = format!(r"\\.\pipe\{}", pipe_id(path));
+    let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+    let ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+    let ok = unsafe { WaitNamedPipeW(wide.as_ptr(), ms) };
+    if ok != 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    // ERROR_SEM_TIMEOUT (121): the wait elapsed with no free instance.
+    if error.raw_os_error() == Some(121) {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "connection timed out",
+        ));
+    }
+    Err(error)
+}
+
 /// Connect to a server socket identified by a per-session filesystem path.
 pub fn connect(path: &Path) -> io::Result<Conn> {
     #[cfg(windows)]
@@ -578,6 +660,40 @@ mod windows_security_tests {
             error.raw_os_error(),
             Some(windows_sys::Win32::Foundation::ERROR_PIPE_BUSY as i32),
             "expected ERROR_PIPE_BUSY after write, got {error}"
+        );
+    }
+
+    #[test]
+    fn client_sees_the_named_pipe_server_pid() {
+        let path = test_pipe("server-pid");
+        let listener = bind(&path).expect("bind owner-only named pipe");
+        let client_path = path.clone();
+        let expected = std::process::id();
+        let client = std::thread::spawn(move || {
+            let conn = connect(&client_path).expect("same-user client connects");
+            conn.server_pid().expect("named-pipe server pid")
+        });
+        let _server = listener.accept().expect("accept same-user client");
+        assert_eq!(client.join().unwrap(), expected);
+    }
+
+    #[test]
+    fn connect_timeout_fails_fast_when_the_pipe_is_absent() {
+        match connect_timeout(&test_pipe("missing"), Duration::from_secs(1)) {
+            Ok(_) => panic!("absent pipe must not connect"),
+            Err(err) => assert_ne!(err.kind(), io::ErrorKind::TimedOut),
+        }
+    }
+
+    #[test]
+    fn connect_timeout_returns_quickly_when_the_pipe_is_listening() {
+        let path = test_pipe("listening-no-accept");
+        let _listener = bind(&path).expect("bind owner-only named pipe");
+        let started = std::time::Instant::now();
+        let _ = connect_timeout(&path, Duration::from_millis(200));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "connect_timeout must not pin the process on a listening pipe"
         );
     }
 }

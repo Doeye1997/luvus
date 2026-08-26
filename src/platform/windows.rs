@@ -455,6 +455,12 @@ mod tests {
     }
 
     #[test]
+    fn current_process_is_not_force_stopped_as_a_foreign_server() {
+        assert!(!super::super::is_stoppable_luvus_pid(0));
+        assert!(!super::super::is_stoppable_luvus_pid(std::process::id()));
+    }
+
+    #[test]
     fn current_process_has_a_stable_identity_and_owner() {
         let pid = std::process::id();
         assert!(process_belongs_to_current_user(pid));
