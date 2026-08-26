@@ -12,7 +12,11 @@ use std::time::Duration;
 
 use fs2::FileExt;
 use interprocess::local_socket::prelude::*;
+#[cfg(not(windows))]
+use interprocess::local_socket::ConnectOptions;
 use interprocess::local_socket::{ListenerOptions, Stream};
+#[cfg(not(windows))]
+use interprocess::ConnectWaitMode;
 
 pub use interprocess::local_socket::Listener;
 
@@ -494,8 +498,33 @@ pub fn connect_timeout(path: &Path, timeout: Duration) -> io::Result<Conn> {
     }
     #[cfg(not(windows))]
     {
-        let _ = timeout;
-        connect(path)
+        use interprocess::local_socket::GenericFilePath;
+        validate_unix_socket_path(path)?;
+        let name = path.to_fs_name::<GenericFilePath>()?;
+        let stream = ConnectOptions::new()
+            .name(name)
+            .wait_mode(ConnectWaitMode::Timeout(timeout))
+            .connect_sync()
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    io::Error::new(io::ErrorKind::TimedOut, error)
+                } else {
+                    error
+                }
+            })?;
+        let conn = Conn::new(stream);
+        validate_peer(&conn)?;
+        Ok(conn)
+    }
+}
+
+/// True when the endpoint exists: we connected, or the wait timed out because
+/// it is busy/hung. False when the name is absent.
+pub fn endpoint_exists(path: &Path, timeout: Duration) -> bool {
+    match connect_timeout(path, timeout) {
+        Ok(_) => true,
+        Err(error) if error.kind() == io::ErrorKind::TimedOut => true,
+        Err(_) => false,
     }
 }
 
@@ -703,6 +732,20 @@ mod windows_security_tests {
             started.elapsed() < Duration::from_secs(2),
             "connect_timeout must not pin the process on a listening pipe"
         );
+    }
+
+    #[test]
+    fn busy_named_pipe_is_not_treated_as_absent() {
+        let path = test_pipe("busy-exists");
+        let _listener = bind(&path).expect("bind owner-only named pipe");
+        assert!(
+            endpoint_exists(&path, Duration::from_millis(200)),
+            "a listening pipe must count as present even if no instance is free"
+        );
+        assert!(!endpoint_exists(
+            &test_pipe("no-such-pipe"),
+            Duration::from_millis(200)
+        ));
     }
 }
 

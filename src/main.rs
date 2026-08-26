@@ -625,7 +625,7 @@ fn remote_ssh_command(args: &[String]) -> Result<Command> {
 }
 
 fn server_running(sock: &Path) -> bool {
-    ipc::transport::connect_timeout(sock, Duration::from_millis(50)).is_ok()
+    ipc::transport::endpoint_exists(sock, Duration::from_millis(50))
 }
 
 fn spawn_server() -> Result<()> {

@@ -257,8 +257,8 @@ pub fn run() -> Result<()> {
     let client_sock = persist::client_socket_path();
     // A responsive listener means another server owns this state directory.
     // Do not reclaim either socket or start a competing process.
-    if transport::connect_timeout(&sock, Duration::from_millis(50)).is_ok()
-        || transport::connect_timeout(&client_sock, Duration::from_millis(50)).is_ok()
+    if transport::endpoint_exists(&sock, Duration::from_millis(50))
+        || transport::endpoint_exists(&client_sock, Duration::from_millis(50))
     {
         return Ok(());
     }
