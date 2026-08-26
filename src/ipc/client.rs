@@ -493,14 +493,32 @@ fn diff_cells(diff: &FrameDiff, truecolor: bool) -> Vec<(u16, u16, Cell)> {
     cells
 }
 
+/// Windows IME follows this caret. Chat agents (Pi) leave the PTY cursor on the
+/// tab row while thinking; Grok keeps it in the prompt. On a tall screen, a caret
+/// on the top two rows is moved to the prompt line above the status bar.
+fn ime_position(
+    cursor: Option<(u16, u16)>,
+    last_cursor: Option<(u16, u16)>,
+    tw: u16,
+    th: u16,
+) -> Option<(u16, u16)> {
+    let visible = cursor.filter(|(x, y)| *x < tw && *y < th);
+    let (x, y) = visible.or(last_cursor.filter(|(x, y)| *x < tw && *y < th))?;
+    let y = if th > 8 && y <= 1 {
+        th.saturating_sub(2)
+    } else {
+        y
+    };
+    Some((x.min(tw.saturating_sub(1)), y))
+}
+
 /// Write `cells` straight to the terminal via the backend (no full re-blit / no
 /// ratatui double-buffer), position the cursor, and flush. `clear` first wipes the
 /// screen (full frame / resync); diffs paint over what's already there.
 ///
 /// `last_cursor` is the last in-bounds pane caret. A working-spinner diff draws
-/// bar cells and often arrives with `cursor: None`; hiding without moving leaves
-/// the hardware cursor on that spinner, and Windows IME then shows unconfirmed
-/// composition in front of `working`.
+/// bar cells and often arrives with `cursor: None`; the caret is shown there so
+/// Windows IME composition stays on the prompt instead of the bar or nowhere.
 fn paint<B>(
     terminal: &mut Terminal<B>,
     cells: &[(u16, u16, Cell)],
@@ -530,18 +548,12 @@ where
             *last_cursor = Some((x, y));
         }
     }
-    let visible_cursor = cursor.filter(|(x, y)| *x < tw && *y < th);
-    let ime = visible_cursor.or(*last_cursor);
-    match ime {
-        Some((x, y)) if x < tw && y < th => {
+    match ime_position(cursor, *last_cursor, tw, th) {
+        Some((x, y)) => {
             backend.set_cursor_position(Position::new(x, y))?;
-            if visible_cursor.is_some() {
-                backend.show_cursor()?;
-            } else {
-                backend.hide_cursor()?;
-            }
+            backend.show_cursor()?;
         }
-        _ => backend.hide_cursor()?,
+        None => backend.hide_cursor()?,
     }
     backend.flush()?;
     Ok(())
@@ -1015,11 +1027,11 @@ mod paint_tests {
             term.backend_mut().get_cursor_position().unwrap(),
             Position::new(1, 0)
         );
-        assert!(!term.backend().cursor_visible());
+        assert!(term.backend().cursor_visible());
     }
 
     #[test]
-    fn out_of_bounds_cursor_hides_but_stays_on_last_pane_cell() {
+    fn out_of_bounds_cursor_keeps_visible_caret_on_last_pane_cell() {
         let mut term = Terminal::new(TestBackend::new(8, 2)).unwrap();
         let mut last = None;
         let cells = vec![cell(" "); 16];
@@ -1045,6 +1057,26 @@ mod paint_tests {
             term.backend_mut().get_cursor_position().unwrap(),
             Position::new(1, 0)
         );
-        assert!(!term.backend().cursor_visible());
+        assert!(term.backend().cursor_visible());
+    }
+
+    #[test]
+    fn tab_row_caret_moves_to_prompt_line_on_a_tall_screen() {
+        assert_eq!(
+            super::ime_position(Some((3, 0)), None, 80, 24),
+            Some((3, 22))
+        );
+        assert_eq!(
+            super::ime_position(Some((3, 1)), None, 80, 24),
+            Some((3, 22))
+        );
+    }
+
+    #[test]
+    fn grok_prompt_caret_stays_put() {
+        assert_eq!(
+            super::ime_position(Some((4, 20)), None, 80, 24),
+            Some((4, 20))
+        );
     }
 }

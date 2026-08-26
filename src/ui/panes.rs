@@ -298,7 +298,9 @@ fn draw_one_pane(
         .filter(|fl| fl.pane == id)
         .map(|fl| (fl.row, fl.scroll));
     let mut scrolled = 0usize;
-    let is_codex = app.status.get(&id).is_some_and(|s| s.agent == "codex");
+    let agent = app.status.get(&id).map(|s| s.agent.as_str()).unwrap_or("");
+    let is_codex = agent == "codex";
+    let chat_agent = is_chat_agent(agent);
     let mut composer_region = None;
     let cursor_pos = match pane.engine.lock() {
         Ok(engine) => {
@@ -409,13 +411,8 @@ fn draw_one_pane(
                 composer_region = engine.codex_composer_region();
             }
             let cur = engine.cursor();
-            if focused
-                && copy.is_none()
-                && cur.visible
-                && cur.x < content.width
-                && cur.y < content.height
-            {
-                Some((content.x + cur.x, content.y + cur.y))
+            if focused && copy.is_none() {
+                pane_ime_cursor(content, cur, composer_region, chat_agent)
             } else {
                 None
             }
@@ -467,6 +464,62 @@ fn draw_one_pane(
         }
     }
     cursor_pos
+}
+
+fn is_chat_agent(agent: &str) -> bool {
+    matches!(
+        agent,
+        "pi" | "claude"
+            | "codex"
+            | "gemini"
+            | "grok"
+            | "opencode"
+            | "copilot"
+            | "cursor"
+            | "aider"
+            | "droid"
+            | "amp"
+            | "fx"
+            | "kimi"
+    )
+}
+
+/// Hardware caret Windows IME follows. Chat agents keep their prompt at the
+/// bottom of the pane; the PTY cursor often sits at the top while they think.
+fn pane_ime_cursor(
+    content: Rect,
+    cur: crate::terminal::vt::Cursor,
+    composer: Option<crate::terminal::vt::CodexComposerRegion>,
+    chat_agent: bool,
+) -> Option<(u16, u16)> {
+    if content.width == 0 || content.height == 0 {
+        return None;
+    }
+    let max_x = content.width.saturating_sub(1);
+    let x = cur.x.min(max_x);
+    if let Some(region) = composer {
+        if region.bottom >= region.top && region.bottom < content.height {
+            let y = if cur.y >= region.top && cur.y <= region.bottom {
+                cur.y
+            } else {
+                region.bottom
+            };
+            return Some((content.x + x, content.y + y));
+        }
+    }
+    let in_view = cur.x < content.width && cur.y < content.height;
+    let lower = content
+        .height
+        .saturating_sub(content.height / 3)
+        .max(content.height.saturating_sub(6));
+    if chat_agent && !(in_view && cur.y >= lower) {
+        return Some((content.x + x, content.y + content.height - 1));
+    }
+    if in_view && cur.visible {
+        Some((content.x + cur.x, content.y + cur.y))
+    } else {
+        None
+    }
 }
 
 /// Give Codex's input a gently raised, theme-aware surface while retaining all
@@ -527,5 +580,46 @@ mod tests {
         assert_eq!(buf[(10, 2)].bg, t.subtle_composer_surface());
         assert_ne!(buf[(10, 2)].bg, t.mantle);
         assert_ne!(buf[(10, 2)].bg, t.surface0);
+    }
+
+    fn cur(x: u16, y: u16, visible: bool) -> crate::terminal::vt::Cursor {
+        crate::terminal::vt::Cursor { x, y, visible }
+    }
+
+    #[test]
+    fn chat_agent_thinking_at_top_pins_ime_to_pane_bottom() {
+        let content = Rect::new(2, 3, 20, 12);
+        assert_eq!(
+            pane_ime_cursor(content, cur(4, 0, false), None, true),
+            Some((6, 14))
+        );
+    }
+
+    #[test]
+    fn chat_agent_prompt_in_lower_third_keeps_pty_cursor() {
+        let content = Rect::new(0, 0, 20, 12);
+        assert_eq!(
+            pane_ime_cursor(content, cur(5, 10, true), None, true),
+            Some((5, 10))
+        );
+    }
+
+    #[test]
+    fn shell_keeps_hidden_cursor_hidden() {
+        let content = Rect::new(0, 0, 20, 12);
+        assert_eq!(
+            pane_ime_cursor(content, cur(0, 0, false), None, false),
+            None
+        );
+    }
+
+    #[test]
+    fn codex_composer_wins_when_pty_cursor_is_outside_it() {
+        let content = Rect::new(1, 2, 20, 10);
+        let region = CodexComposerRegion { top: 6, bottom: 8 };
+        assert_eq!(
+            pane_ime_cursor(content, cur(3, 0, true), Some(region), true),
+            Some((4, 10))
+        );
     }
 }
