@@ -992,18 +992,26 @@ impl Manifests {
         let mut tokens = Vec::new();
         let mut token = String::new();
         let mut quoted = false;
+        let mut token_started = false;
         for character in command.chars() {
             match character {
-                '"' => quoted = !quoted,
+                '"' => {
+                    quoted = !quoted;
+                    token_started = true;
+                }
                 character if character.is_whitespace() && !quoted => {
-                    if !token.is_empty() {
+                    if token_started {
                         tokens.push(std::mem::take(&mut token));
+                        token_started = false;
                     }
                 }
-                character => token.push(character),
+                character => {
+                    token.push(character);
+                    token_started = true;
+                }
             }
         }
-        if !token.is_empty() {
+        if token_started {
             tokens.push(token);
         }
         tokens
@@ -1015,18 +1023,21 @@ impl Manifests {
     fn match_interpreter_script(&self, token: &str) -> Option<String> {
         self.match_binary(binary_name(token)).or_else(|| {
             let normalized = token.to_lowercase().replace('\\', "/");
-            normalized.split('/').rev().find_map(|segment| {
-                let segment = segment
-                    .strip_suffix(".cjs")
-                    .or_else(|| segment.strip_suffix(".mjs"))
-                    .or_else(|| segment.strip_suffix(".js"))
-                    .or_else(|| segment.strip_suffix(".py"))
-                    .unwrap_or(segment);
-                self.agents
-                    .iter()
-                    .find(|agent| agent.distinct.iter().any(|pattern| *pattern == segment))
-                    .map(|agent| agent.name.clone())
-            })
+            let mut segments = normalized.split('/').rev();
+            let script = strip_script_extension(segments.next()?);
+
+            self.agents
+                .iter()
+                .find(|agent| agent.all().any(|pattern| pattern == script))
+                .map(|agent| agent.name.clone())
+                .or_else(|| {
+                    segments.find_map(|segment| {
+                        self.agents
+                            .iter()
+                            .find(|agent| agent.distinct.iter().any(|pattern| pattern == segment))
+                            .map(|agent| agent.name.clone())
+                    })
+                })
         })
     }
 
@@ -1082,6 +1093,16 @@ pub(crate) fn binary_name(token: &str) -> &str {
         .unwrap_or(token)
         .trim_start_matches('-')
         .trim_end_matches(".exe")
+}
+
+/// The basename of a script without the extension used by common interpreters.
+fn strip_script_extension(token: &str) -> &str {
+    token
+        .strip_suffix(".cjs")
+        .or_else(|| token.strip_suffix(".mjs"))
+        .or_else(|| token.strip_suffix(".js"))
+        .or_else(|| token.strip_suffix(".py"))
+        .unwrap_or(token)
 }
 
 /// Runtimes that execute an agent as a script, so the name to look for is the
@@ -1315,6 +1336,12 @@ mod tests {
             m.launch_args_for(&["claude".into()], "claude"),
             Some(vec![])
         );
+        // Empty quoted arguments are real argv entries and must survive so a
+        // relaunch does not silently change the agent's configuration.
+        assert_eq!(
+            m.launch_args_for(&[r#"claude --model "" --yes"#.into()], "claude"),
+            Some(vec!["--model".into(), "".into(), "--yes".into()])
+        );
         // Windows process inspection supplies the full Node command line, so
         // Pi's npm package name in the script slot resolves to the agent.
         assert_eq!(
@@ -1322,6 +1349,12 @@ mod tests {
                 r#""C:\Program Files\nodejs\node.exe" C:\Users\me\AppData\Roaming\npm\node_modules\@earendil-works\pi-coding-agent\dist\cli.js"#.into()
             ]),
             Some("pi".into())
+        );
+        // An ambiguous brand name is still deliberate when it is the script
+        // basename in a running interpreter command.
+        assert_eq!(
+            m.agent_in_processes(&[r#"node C:\tools\grok.js"#.into()]),
+            Some("grok".into())
         );
     }
 
