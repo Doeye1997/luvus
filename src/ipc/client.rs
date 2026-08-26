@@ -191,6 +191,9 @@ where
     // Main thread: paint frames as they arrive. A full frame repaints the screen; a
     // diff writes only its changed cells straight to the terminal (no full re-blit,
     // no reconstructed frame) — so a busy session costs O(changed cells), not O(screen).
+    // `last_cursor` is the last pane caret: spinner diffs often hide the cursor, and
+    // Windows IME follows the hardware cursor left on the last drawn cell.
+    let mut last_cursor = None;
     let exit = loop {
         match protocol::read_message::<_, ServerMessage>(&mut reader) {
             // A full frame repaints the whole screen; a diff writes *only its changed
@@ -203,6 +206,7 @@ where
                     &frame_cells(&frame, truecolor),
                     frame.cursor,
                     true,
+                    &mut last_cursor,
                 );
                 sync_end();
                 if r.is_err() {
@@ -217,7 +221,13 @@ where
             }
             Ok(ServerMessage::FrameDiff(diff)) => {
                 sync_begin();
-                let r = paint(terminal, &diff_cells(&diff, truecolor), diff.cursor, false);
+                let r = paint(
+                    terminal,
+                    &diff_cells(&diff, truecolor),
+                    diff.cursor,
+                    false,
+                    &mut last_cursor,
+                );
                 sync_end();
                 if r.is_err() {
                     crate::logging::event(
@@ -486,11 +496,17 @@ fn diff_cells(diff: &FrameDiff, truecolor: bool) -> Vec<(u16, u16, Cell)> {
 /// Write `cells` straight to the terminal via the backend (no full re-blit / no
 /// ratatui double-buffer), position the cursor, and flush. `clear` first wipes the
 /// screen (full frame / resync); diffs paint over what's already there.
+///
+/// `last_cursor` is the last in-bounds pane caret. A working-spinner diff draws
+/// bar cells and often arrives with `cursor: None`; hiding without moving leaves
+/// the hardware cursor on that spinner, and Windows IME then shows unconfirmed
+/// composition in front of `working`.
 fn paint<B>(
     terminal: &mut Terminal<B>,
     cells: &[(u16, u16, Cell)],
     cursor: Option<(u16, u16)>,
     clear: bool,
+    last_cursor: &mut Option<(u16, u16)>,
 ) -> Result<()>
 where
     B: Backend,
@@ -509,10 +525,20 @@ where
             .filter(|(x, y, _)| *x < tw && *y < th)
             .map(|(x, y, c)| (*x, *y, c)),
     )?;
-    match cursor {
+    if let Some((x, y)) = cursor {
+        if x < tw && y < th {
+            *last_cursor = Some((x, y));
+        }
+    }
+    let ime = cursor.filter(|(x, y)| *x < tw && *y < th).or(*last_cursor);
+    match ime {
         Some((x, y)) if x < tw && y < th => {
             backend.set_cursor_position(Position::new(x, y))?;
-            backend.show_cursor()?;
+            if cursor.is_some() {
+                backend.show_cursor()?;
+            } else {
+                backend.hide_cursor()?;
+            }
         }
         _ => backend.hide_cursor()?,
     }
@@ -886,19 +912,108 @@ mod render_tests {
         };
 
         let mut term = Terminal::new(TestBackend::new(3, 1)).unwrap();
+        let mut last_cursor = None;
         // Paint a full frame, then apply a diff that changes only one cell.
-        paint(&mut term, &frame_cells(&f0, true), f0.cursor, true).unwrap();
+        paint(
+            &mut term,
+            &frame_cells(&f0, true),
+            f0.cursor,
+            true,
+            &mut last_cursor,
+        )
+        .unwrap();
         let diff = FrameDiff {
             width: 3,
             height: 1,
             runs: protocol::diff_runs(&f0, &f1),
             cursor: f1.cursor,
         };
-        paint(&mut term, &diff_cells(&diff, true), diff.cursor, false).unwrap();
+        paint(
+            &mut term,
+            &diff_cells(&diff, true),
+            diff.cursor,
+            false,
+            &mut last_cursor,
+        )
+        .unwrap();
 
         // The terminal now shows f1 — the client stays correct without ever
         // re-blitting the whole frame.
         let got = protocol::frame_from_buffer(term.backend().buffer(), None);
         assert_eq!(got.cells, f1.cells);
+    }
+}
+
+#[cfg(test)]
+mod paint_tests {
+    use super::paint;
+    use crate::ipc::protocol::{self, FrameData, FrameDiff};
+    use ratatui::backend::{Backend, TestBackend};
+    use ratatui::layout::Position;
+    use ratatui::Terminal;
+
+    fn cell(s: &str) -> protocol::CellData {
+        protocol::CellData {
+            symbol: s.into(),
+            fg: 0,
+            bg: 0,
+            mods: 0,
+        }
+    }
+
+    #[test]
+    fn hidden_cursor_stays_on_pane_after_bar_spinner_diff() {
+        let mut term = Terminal::new(TestBackend::new(8, 2)).unwrap();
+        let mut last = None;
+        let mut cells = vec![cell(" "); 16];
+        let f0 = FrameData {
+            width: 8,
+            height: 2,
+            cells: cells.clone(),
+            cursor: Some((1, 0)),
+        };
+        paint(
+            &mut term,
+            &super::frame_cells(&f0, true),
+            f0.cursor,
+            true,
+            &mut last,
+        )
+        .unwrap();
+        assert_eq!(last, Some((1, 0)));
+
+        // Crossterm's draw walks the hardware cursor onto each cell. TestBackend
+        // does not, so park it on the bottom-right spinner cell the same way.
+        term.backend_mut()
+            .set_cursor_position(Position::new(7, 1))
+            .unwrap();
+
+        cells[15] = cell("*");
+        let f1 = FrameData {
+            width: 8,
+            height: 2,
+            cells,
+            cursor: None,
+        };
+        let diff = FrameDiff {
+            width: 8,
+            height: 2,
+            runs: protocol::diff_runs(&f0, &f1),
+            cursor: None,
+        };
+        paint(
+            &mut term,
+            &super::diff_cells(&diff, true),
+            diff.cursor,
+            false,
+            &mut last,
+        )
+        .unwrap();
+
+        assert_eq!(
+            term.backend_mut().get_cursor_position().unwrap(),
+            Position::new(1, 0)
+        );
+        assert!(!term.backend().cursor_visible());
     }
 }
