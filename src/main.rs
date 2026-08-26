@@ -933,10 +933,19 @@ fn send_server_stop() -> Result<bool> {
     let api = persist::socket_path();
     let (conn, timed_out) = match ipc::transport::connect_timeout(&api, SERVER_CONTROL_TIMEOUT) {
         Ok(conn) => (Some(conn), false),
-        Err(error) if error.kind() == io::ErrorKind::TimedOut => (None, true),
-        Err(_) => match ipc::transport::connect_timeout(&client_socket, SERVER_CONTROL_TIMEOUT) {
-            Ok(conn) => (Some(conn), false),
-            Err(error) if error.kind() == io::ErrorKind::TimedOut => (None, true),
+        Err(error) => match ipc::transport::connect_timeout(&client_socket, SERVER_CONTROL_TIMEOUT)
+        {
+            Ok(conn) => {
+                if error.kind() == io::ErrorKind::TimedOut {
+                    drop(conn);
+                    return Err(anyhow!(
+                        "luvus server is running but the control socket did not answer"
+                    ));
+                }
+                (Some(conn), false)
+            }
+            Err(client_error) if client_error.kind() == io::ErrorKind::TimedOut => (None, true),
+            Err(_) if error.kind() == io::ErrorKind::TimedOut => (None, true),
             Err(_) => return Ok(false),
         },
     };
