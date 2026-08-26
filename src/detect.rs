@@ -930,7 +930,8 @@ impl Manifests {
 
     fn agent_in_process_command(&self, cmd: &str) -> Option<String> {
         let low = cmd.to_lowercase();
-        let mut tokens = low.split_whitespace();
+        let tokens = Self::command_tokens(&low);
+        let mut tokens = tokens.iter().map(String::as_str);
         let first = binary_name(tokens.next()?);
         if let Some(a) = self.match_binary(first) {
             return Some(a);
@@ -944,7 +945,7 @@ impl Manifests {
                 if t.starts_with('-') {
                     continue;
                 }
-                return self.match_binary(binary_name(t));
+                return self.match_interpreter_script(t);
             }
         }
         None
@@ -959,7 +960,7 @@ impl Manifests {
     /// nothing rather than guessing.
     pub fn launch_args_for(&self, running: &[String], agent: &str) -> Option<Vec<String>> {
         for cmd in running {
-            let tokens: Vec<&str> = cmd.split_whitespace().collect();
+            let tokens = Self::command_tokens(cmd);
             let Some((first, rest)) = tokens.split_first() else {
                 continue;
             };
@@ -975,7 +976,7 @@ impl Manifests {
                         continue;
                     }
                     let t_low = t.to_lowercase();
-                    if self.match_binary(binary_name(&t_low)).as_deref() == Some(agent) {
+                    if self.match_interpreter_script(&t_low).as_deref() == Some(agent) {
                         return Some(rest[(i + 1)..].iter().map(|s| s.to_string()).collect());
                     }
                     break; // the first non-flag arg is the script slot; nothing later counts
@@ -983,6 +984,50 @@ impl Manifests {
             }
         }
         None
+    }
+
+    /// Split a process command line into argv-like tokens, retaining spaces
+    /// inside quoted paths such as `"C:\\Program Files\\nodejs\\node.exe"`.
+    fn command_tokens(command: &str) -> Vec<String> {
+        let mut tokens = Vec::new();
+        let mut token = String::new();
+        let mut quoted = false;
+        for character in command.chars() {
+            match character {
+                '"' => quoted = !quoted,
+                character if character.is_whitespace() && !quoted => {
+                    if !token.is_empty() {
+                        tokens.push(std::mem::take(&mut token));
+                    }
+                }
+                character => token.push(character),
+            }
+        }
+        if !token.is_empty() {
+            tokens.push(token);
+        }
+        tokens
+    }
+
+    /// Match an interpreter's script slot by basename or by a distinctive
+    /// package directory in its path. npm shims commonly execute `cli.js`
+    /// from a directory named after the package (`...\\pi-coding-agent\\...`).
+    fn match_interpreter_script(&self, token: &str) -> Option<String> {
+        self.match_binary(binary_name(token)).or_else(|| {
+            let normalized = token.to_lowercase().replace('\\', "/");
+            normalized.split('/').rev().find_map(|segment| {
+                let segment = segment
+                    .strip_suffix(".cjs")
+                    .or_else(|| segment.strip_suffix(".mjs"))
+                    .or_else(|| segment.strip_suffix(".js"))
+                    .or_else(|| segment.strip_suffix(".py"))
+                    .unwrap_or(segment);
+                self.agents
+                    .iter()
+                    .find(|agent| agent.distinct.iter().any(|pattern| *pattern == segment))
+                    .map(|agent| agent.name.clone())
+            })
+        })
     }
 
     /// The agent whose patterns name exactly this binary.
@@ -1269,6 +1314,14 @@ mod tests {
         assert_eq!(
             m.launch_args_for(&["claude".into()], "claude"),
             Some(vec![])
+        );
+        // Windows process inspection supplies the full Node command line, so
+        // Pi's npm package name in the script slot resolves to the agent.
+        assert_eq!(
+            m.agent_in_processes(&[
+                r#""C:\Program Files\nodejs\node.exe" C:\Users\me\AppData\Roaming\npm\node_modules\@earendil-works\pi-coding-agent\dist\cli.js"#.into()
+            ]),
+            Some("pi".into())
         );
     }
 
