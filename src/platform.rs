@@ -375,24 +375,58 @@ pub fn is_stoppable_luvus_pid(pid: u32) -> bool {
 }
 
 /// End `pid` and its children. Used only after [`is_stoppable_luvus_pid`].
-pub fn force_terminate(pid: u32) {
+pub fn force_terminate(pid: u32) -> std::io::Result<()> {
     #[cfg(windows)]
     {
-        let _ = no_window(
+        let status = no_window(
             std::process::Command::new("taskkill")
                 .args(["/PID", &pid.to_string(), "/T", "/F"])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null()),
         )
-        .status();
+        .status()?;
+        if status.success() || !is_stoppable_luvus_pid(pid) {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!(
+                "taskkill exited with {status}"
+            )))
+        }
     }
     #[cfg(unix)]
-    unsafe {
-        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    {
+        let pid_t = pid as libc::pid_t;
+        let mut tree = process_tree(pid);
+        if tree.is_empty() {
+            tree.push(ProcInfo {
+                pid,
+                depth: 0,
+                command: String::new(),
+            });
+        }
+        let pgid = unsafe { libc::getpgid(pid_t) };
+        if pgid == pid_t {
+            let _ = unsafe { libc::kill(-pid_t, libc::SIGKILL) };
+        }
+        let mut root_error = None;
+        for proc in tree.iter().rev() {
+            let result = unsafe { libc::kill(proc.pid as libc::pid_t, libc::SIGKILL) };
+            if result != 0 && proc.pid == pid {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    root_error = Some(error);
+                }
+            }
+        }
+        match root_error {
+            Some(error) if is_stoppable_luvus_pid(pid) => Err(error),
+            _ => Ok(()),
+        }
     }
     #[cfg(not(any(windows, unix)))]
     {
         let _ = pid;
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
     }
 }
 
@@ -975,6 +1009,28 @@ mod tests {
     fn unix_stoppable_pid_rejects_self_and_missing() {
         assert!(!super::is_stoppable_luvus_pid(0));
         assert!(!super::is_stoppable_luvus_pid(std::process::id()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn force_terminate_kills_a_setsid_child() {
+        use std::os::unix::process::CommandExt;
+        let mut command = std::process::Command::new("sleep");
+        command
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        unsafe {
+            command.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().expect("spawn sleep");
+        super::force_terminate(child.id()).expect("kill setsid child");
+        let status = child.wait().expect("reap sleep");
+        assert!(!status.success());
     }
 
     #[test]

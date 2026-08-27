@@ -516,9 +516,9 @@ fn ensure_server_ready(sock: &Path) -> Result<()> {
                 }
                 Ok(())
             }
-            // Connected: the pipe accepted. A slow or false IO reply is not a
-            // mute server. #144: do not kill a healthy session on a timeout.
-            Err(_) => Ok(()),
+            // Accept threads stay alive after the app loop dies. Connect is not
+            // liveness; recycle so reattach does not wait forever on frames.
+            Err(_) => recycle_unresponsive_server(sock),
         },
         Err(error) if error.kind() == io::ErrorKind::TimedOut => recycle_unresponsive_server(sock),
         Err(_) => {
@@ -941,15 +941,7 @@ fn send_server_stop() -> Result<bool> {
         Ok(conn) => (Some(conn), false),
         Err(error) => match ipc::transport::connect_timeout(&client_socket, SERVER_CONTROL_TIMEOUT)
         {
-            Ok(conn) => {
-                if error.kind() == io::ErrorKind::TimedOut {
-                    drop(conn);
-                    return Err(anyhow!(
-                        "luvus server is running but the control socket did not answer"
-                    ));
-                }
-                (Some(conn), false)
-            }
+            Ok(conn) => (Some(conn), error.kind() == io::ErrorKind::TimedOut),
             Err(client_error) if client_error.kind() == io::ErrorKind::TimedOut => (None, true),
             Err(_) if error.kind() == io::ErrorKind::TimedOut => (None, true),
             Err(_) => return Ok(false),
@@ -968,18 +960,13 @@ fn send_server_stop() -> Result<bool> {
     let response = match server_control_request("server.stop") {
         Ok(response) => response,
         Err(error) => {
-            // Stop may have already taken effect: the pipe closed before the
-            // acknowledgement was readable. Wait for the socket to vanish
-            // before force-killing, so a healthy shutdown is not interrupted.
-            if wait_for_shutdown(&client_socket).is_ok() {
+            // A mute app loop still accepts on dedicated listener threads.
+            // One short probe: if both endpoints are already gone, stop won.
+            // Otherwise reclaim the stoppable process instead of hanging attach.
+            if !ipc::transport::endpoint_exists(&api, Duration::from_millis(50))
+                && !ipc::transport::endpoint_exists(&client_socket, Duration::from_millis(50))
+            {
                 return Ok(true);
-            }
-            // Client socket still accepts: server is reachable. The stop
-            // request timed out; do not kill the session.
-            if ipc::transport::connect_timeout(&client_socket, SERVER_CONTROL_TIMEOUT).is_ok() {
-                return Err(anyhow!(
-                    "luvus server is running but the control socket did not answer"
-                ));
             }
             if force_stop_unresponsive(pid, &client_socket).is_ok() {
                 return Ok(true);
@@ -1009,7 +996,11 @@ fn force_stop_unresponsive(pid: Option<u32>, sock: &Path) -> Result<bool> {
             "luvus server did not answer and pid {pid} is not a stoppable Luvus process"
         ));
     }
-    platform::force_terminate(pid);
+    if let Err(error) = platform::force_terminate(pid) {
+        if platform::is_stoppable_luvus_pid(pid) {
+            return Err(anyhow!("failed to force-stop luvus pid {pid}: {error}"));
+        }
+    }
     wait_for_shutdown(sock)?;
     Ok(true)
 }
@@ -1251,6 +1242,13 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+
+    #[test]
+    fn send_server_stop_reports_absent_when_no_sockets() {
+        let _env = crate::persist::test_env("stop-absent");
+        crate::persist::ensure_session_dir();
+        assert!(!send_server_stop().expect("absent server is not an error"));
+    }
 
     #[test]
     fn only_exact_json_session_list_uses_discovery_route() {

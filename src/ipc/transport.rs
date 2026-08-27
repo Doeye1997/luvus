@@ -9,6 +9,8 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(windows)]
+use std::time::Instant;
 
 use fs2::FileExt;
 use interprocess::local_socket::prelude::*;
@@ -478,15 +480,13 @@ pub(crate) fn discovery_address(path: &Path) -> String {
 
 /// Connect, but do not block the caller forever.
 ///
-/// Windows named-pipe `connect` waits indefinitely when every instance is busy.
-/// A helper thread cannot fix that: `main` still waits for the blocked
-/// `connect` thread, so `ping` / `server stop` appear hung after the timeout.
-/// Wait on the pipe with a kernel timeout, then connect.
+/// Windows named-pipe `CreateFile` waits indefinitely when every instance is
+/// busy. Loop `CreateFile` / `WaitNamedPipe` against the remaining deadline
+/// instead of calling unbounded `connect()` after one successful wait.
 pub fn connect_timeout(path: &Path, timeout: Duration) -> io::Result<Conn> {
     #[cfg(windows)]
     {
-        wait_for_named_pipe(path, timeout)?;
-        connect(path)
+        connect_named_pipe_timeout(path, timeout)
     }
     #[cfg(not(windows))]
     {
@@ -521,25 +521,64 @@ pub fn endpoint_exists(path: &Path, timeout: Duration) -> bool {
 }
 
 #[cfg(windows)]
-fn wait_for_named_pipe(path: &Path, timeout: Duration) -> io::Result<()> {
+fn connect_named_pipe_timeout(path: &Path, timeout: Duration) -> io::Result<Conn> {
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::{
+        ERROR_PIPE_BUSY, ERROR_SEM_TIMEOUT, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
     use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
 
     let name = format!(r"\\.\pipe\{}", pipe_id(path));
     let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
-    let ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
-    let ok = unsafe { WaitNamedPipeW(wide.as_ptr(), ms) };
-    if ok != 0 {
-        return Ok(());
+    let deadline = Instant::now() + timeout;
+    loop {
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle != INVALID_HANDLE_VALUE {
+            let owned = unsafe { OwnedHandle::from_raw_handle(handle) };
+            let np = interprocess::os::windows::named_pipe::local_socket::Stream::try_from(owned)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            let stream = Stream::from(np);
+            validate_connected_server(&stream)?;
+            return Ok(Conn::new(stream));
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(ERROR_PIPE_BUSY as i32) {
+            return Err(error);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "connection timed out",
+            ));
+        }
+        let ms = u32::try_from(remaining.as_millis()).unwrap_or(u32::MAX);
+        let waited = unsafe { WaitNamedPipeW(wide.as_ptr(), ms) };
+        if waited != 0 {
+            continue;
+        }
+        let wait_error = io::Error::last_os_error();
+        if wait_error.raw_os_error() == Some(ERROR_SEM_TIMEOUT as i32) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "connection timed out",
+            ));
+        }
+        return Err(wait_error);
     }
-    let error = io::Error::last_os_error();
-    // ERROR_SEM_TIMEOUT (121): the wait elapsed with no free instance.
-    if error.raw_os_error() == Some(121) {
-        return Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "connection timed out",
-        ));
-    }
-    Err(error)
 }
 
 /// Connect to a server socket identified by a per-session filesystem path.
@@ -719,11 +758,43 @@ mod windows_security_tests {
         let path = test_pipe("listening-no-accept");
         let _listener = bind(&path).expect("bind owner-only named pipe");
         let started = std::time::Instant::now();
-        let _ = connect_timeout(&path, Duration::from_millis(200));
+        let result = connect_timeout(&path, Duration::from_millis(200));
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "connect_timeout must not pin the process on a listening pipe"
         );
+        match result {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => {}
+            Err(error) => panic!("unexpected connect_timeout error: {error}"),
+        }
+    }
+
+    #[test]
+    fn connect_timeout_times_out_when_every_instance_is_busy() {
+        let path = test_pipe("busy-timeout");
+        let listener = bind(&path).expect("bind owner-only named pipe");
+        let occupied_path = path.clone();
+        let occupied = std::thread::spawn(move || connect(&occupied_path));
+        let _peer = listener.accept().expect("accept occupying client");
+        let first = occupied
+            .join()
+            .expect("occupying connect")
+            .expect("occupying client");
+        let started = std::time::Instant::now();
+        let result = connect_timeout(&path, Duration::from_millis(200));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "busy-pipe connect_timeout must not call unbounded connect"
+        );
+        match result {
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => {}
+            Ok(_) => {
+                // Listener may have created another instance; still must be fast.
+            }
+            Err(error) => panic!("unexpected connect_timeout error: {error}"),
+        }
+        drop(first);
     }
 
     #[test]

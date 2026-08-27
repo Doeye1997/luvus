@@ -466,6 +466,32 @@ impl Drop for ServerPidFile {
     }
 }
 
+#[cfg(test)]
+mod server_pid_file_tests {
+    use super::*;
+
+    #[test]
+    fn server_pid_file_reads_the_live_process() {
+        let _env = test_env("server-pid-live");
+        ensure_session_dir();
+        let claimed = ServerPidFile::claim();
+        assert_eq!(ServerPidFile::read(), Some(std::process::id()));
+        drop(claimed);
+        assert_eq!(ServerPidFile::read(), None);
+    }
+
+    #[test]
+    fn server_pid_file_rejects_a_mismatched_start_marker() {
+        let _env = test_env("server-pid-mismatch");
+        ensure_session_dir();
+        let claimed = ServerPidFile::claim();
+        let path = session_dir().join("server.pid");
+        fs::write(&path, format!("{} not-a-live-marker", std::process::id())).unwrap();
+        assert_eq!(ServerPidFile::read(), None);
+        drop(claimed);
+    }
+}
+
 /// Create the selected runtime directory with the same owner-only protection as
 /// the global root. This is the startup-lock namespace for one server only.
 pub fn ensure_session_dir() -> PathBuf {
