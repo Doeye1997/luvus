@@ -931,22 +931,18 @@ impl Manifests {
     fn agent_in_process_command(&self, cmd: &str) -> Option<String> {
         let low = cmd.to_lowercase();
         let tokens = Self::command_tokens(&low);
-        let mut tokens = tokens.iter().map(String::as_str);
-        let first = binary_name(tokens.next()?);
+        let tokens = unwrap_leading_env(&tokens);
+        let (first, rest) = tokens.split_first()?;
+        let first = binary_name(first);
         if let Some(a) = self.match_binary(first) {
             return Some(a);
         }
         // Several agents ship as a script run by an interpreter, so argv[0]
-        // is `node` / `python` and the real name is the script slot: the first
-        // non-flag argument. Nothing later counts -- `cargo test --example amp`
-        // must not resolve to amp.
+        // is `node` / `python` and the real name is the script slot. Nothing
+        // later counts -- `cargo test --example amp` must not resolve to amp.
         if is_interpreter(first) {
-            for t in tokens {
-                if t.starts_with('-') {
-                    continue;
-                }
-                return self.match_interpreter_script(t);
-            }
+            let i = interpreter_script_slot(rest)?;
+            return self.match_interpreter_script(&rest[i]);
         }
         None
     }
@@ -961,6 +957,7 @@ impl Manifests {
     pub fn launch_args_for(&self, running: &[String], agent: &str) -> Option<Vec<String>> {
         for cmd in running {
             let tokens = Self::command_tokens(cmd);
+            let tokens = unwrap_leading_env(&tokens);
             let Some((first, rest)) = tokens.split_first() else {
                 continue;
             };
@@ -968,18 +965,14 @@ impl Manifests {
             if self.match_binary(binary_name(&first_low)).as_deref() == Some(agent) {
                 return Some(rest.iter().map(|s| s.to_string()).collect());
             }
-            // Interpreter form: the agent token is the first non-flag argument,
-            // and nothing before it is a launch flag.
+            // Interpreter form: the agent token is the script slot, and nothing
+            // before it is a launch flag.
             if is_interpreter(binary_name(&first_low)) {
-                for (i, t) in rest.iter().enumerate() {
-                    if t.starts_with('-') {
-                        continue;
-                    }
-                    let t_low = t.to_lowercase();
+                if let Some(i) = interpreter_script_slot(rest) {
+                    let t_low = rest[i].to_lowercase();
                     if self.match_interpreter_script(&t_low).as_deref() == Some(agent) {
                         return Some(rest[(i + 1)..].iter().map(|s| s.to_string()).collect());
                     }
-                    break; // the first non-flag arg is the script slot; nothing later counts
                 }
             }
         }
@@ -1158,12 +1151,59 @@ pub(crate) fn is_interpreter(base: &str) -> bool {
             | "uvx"
             | "ruby"
             | "perl"
-            | "env"
             | "sh"
             | "bash"
             | "zsh"
             | "fish"
     )
+}
+
+/// Conservatively unwrap `env KEY=value command ...`.
+///
+/// Only that form is unwrapped: a leading `env` followed by zero or more
+/// `KEY=value` assignments, then a command. Flags after `env` are an unknown
+/// wrapper and the original argv is left untouched -- later arguments are not
+/// scanned for an agent-looking path.
+fn unwrap_leading_env(tokens: &[String]) -> &[String] {
+    let Some(first) = tokens.first() else {
+        return tokens;
+    };
+    if binary_name(&first.to_lowercase()) != "env" {
+        return tokens;
+    }
+    let mut i = 1;
+    while i < tokens.len() {
+        let t = &tokens[i];
+        if t.starts_with('-') {
+            return tokens;
+        }
+        if !t.contains('=') {
+            return &tokens[i..];
+        }
+        i += 1;
+    }
+    &tokens[i..]
+}
+
+/// Index of the script an interpreter will run, among the arguments after
+/// argv[0]. Flags are skipped. Values consumed by `-r`, `--require`, and
+/// `--loader` are skipped with their option. The first remaining argument is
+/// the script; later arguments are not scanned.
+fn interpreter_script_slot(args: &[String]) -> Option<usize> {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg.starts_with('-') {
+            if matches!(arg, "-r" | "--require" | "--loader") {
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        return Some(i);
+    }
+    None
 }
 
 /// True when `needle` appears in `hay` as a **standalone word**.
@@ -1422,6 +1462,50 @@ mod tests {
                 r#"node C:\work\node_modules\@earendil-works\pi-coding-agent\dist\cli.js"#.into()
             ]),
             Some("pi".into())
+        );
+    }
+
+    #[test]
+    fn interpreter_script_slot_skips_require_value() {
+        let m = Manifests::builtin();
+        let cmd = r#"node --require C:\hooks\loader.js C:\Users\me\AppData\Roaming\npm\node_modules\@earendil-works\pi-coding-agent\dist\cli.js --yes"#;
+        assert_eq!(m.agent_in_processes(&[cmd.into()]), Some("pi".into()));
+        assert_eq!(
+            m.launch_args_for(&[cmd.into()], "pi"),
+            Some(vec!["--yes".into()])
+        );
+    }
+
+    #[test]
+    fn interpreter_script_slot_skips_loader_value() {
+        let m = Manifests::builtin();
+        let cmd = r#"node --loader C:\hooks\loader.js C:\Users\me\AppData\Roaming\npm\node_modules\@earendil-works\pi-coding-agent\dist\cli.js --yes"#;
+        assert_eq!(m.agent_in_processes(&[cmd.into()]), Some("pi".into()));
+        assert_eq!(
+            m.launch_args_for(&[cmd.into()], "pi"),
+            Some(vec!["--yes".into()])
+        );
+    }
+
+    #[test]
+    fn interpreter_script_slot_ignores_agent_looking_loader() {
+        let m = Manifests::builtin();
+        assert_eq!(
+            m.agent_in_processes(&[
+                r#"node --require C:\work\node_modules\pi-coding-agent\hooks\loader.js C:\work\build.js"#.into()
+            ]),
+            None
+        );
+    }
+
+    #[test]
+    fn interpreter_script_slot_unwraps_env_key_value() {
+        let m = Manifests::builtin();
+        let cmd = r#"env FOO=bar node C:\work\node_modules\@earendil-works\pi-coding-agent\dist\cli.js --yes"#;
+        assert_eq!(m.agent_in_processes(&[cmd.into()]), Some("pi".into()));
+        assert_eq!(
+            m.launch_args_for(&[cmd.into()], "pi"),
+            Some(vec!["--yes".into()])
         );
     }
 
