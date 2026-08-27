@@ -178,6 +178,12 @@ pub enum AppEvent {
     /// (Windows) or `ps` failed — detection then falls back to text heuristics
     /// rather than concluding that no agent is running.
     ProcScanned(Option<std::collections::HashMap<u32, Vec<String>>>),
+    /// One process-table snapshot resolved every pane cwd, plus workspace
+    /// branches. Process and git probes run off-loop; the app loop only applies.
+    CwdScanned {
+        panes: Vec<(crate::ids::PaneId, crate::platform::PaneCwdEvidence)>,
+        branches: Vec<(String, Option<String>)>,
+    },
     /// A Mission Control usage scan finished (docs/54, MC-2/MC-4): best-effort
     /// tokens/context/cost keyed by agent + session id, read off-loop from native
     /// agent stores, plus each ledger's mtime so unchanged sessions stay cached.

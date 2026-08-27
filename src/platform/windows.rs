@@ -379,13 +379,36 @@ pub(super) fn process_cwd(pid: u32) -> Option<std::path::PathBuf> {
             &mut bytes_read,
         )
     } != 0;
-    if !success || bytes_read < 2 {
+    if !success || bytes_read != length {
         return None;
     }
-    let n = (bytes_read / size_of::<u16>()).min(buffer.len());
-    let path = String::from_utf16_lossy(&buffer[..n]);
-    let path = path.trim_end_matches(['\\', '\0']);
+    let path = String::from_utf16_lossy(&buffer);
+    let path = trim_windows_cwd(&path);
     (!path.is_empty()).then(|| std::path::PathBuf::from(path))
+}
+
+/// Strip trailing NUL and separators without turning `C:\` into drive-relative `C:`.
+fn trim_windows_cwd(path: &str) -> &str {
+    let path = path.trim_end_matches('\0');
+    let trimmed = path.trim_end_matches(['\\', '/']);
+    if trimmed.is_empty() || trimmed.ends_with(':') {
+        path
+    } else {
+        trimmed
+    }
+}
+
+pub(super) fn descendant_pid_trees(
+    roots: &[u32],
+) -> std::collections::HashMap<u32, Vec<(u32, u16)>> {
+    let Some(snapshot) = ProcessSnapshot::capture() else {
+        return std::collections::HashMap::new();
+    };
+    roots
+        .iter()
+        .copied()
+        .map(|root| (root, snapshot.descendants(root)))
+        .collect()
 }
 
 #[cfg(not(target_pointer_width = "64"))]
@@ -473,10 +496,93 @@ mod tests {
             crate::platform::same_path(&cwd, &expected),
             "process_cwd={cwd:?} current_dir={expected:?}"
         );
-        let tree = crate::platform::process_tree_cwd(pid).expect("tree cwd");
+        let tree = crate::platform::scan_pane_cwds(&[pid])
+            .into_iter()
+            .next()
+            .and_then(|evidence| evidence.owner_cwd.or(evidence.descendant_git_cwd))
+            .expect("tree cwd");
         assert!(
             crate::platform::same_path(&tree, &expected),
-            "process_tree_cwd={tree:?} current_dir={expected:?}"
+            "scan_pane_cwds={tree:?} current_dir={expected:?}"
+        );
+    }
+
+    #[test]
+    fn trim_windows_cwd_keeps_drive_root() {
+        assert_eq!(trim_windows_cwd(r"C:\"), r"C:\");
+        assert_eq!(trim_windows_cwd("C:\\\0"), r"C:\");
+        assert_eq!(trim_windows_cwd(r"C:\foo\"), r"C:\foo");
+        assert_eq!(trim_windows_cwd(r"C:\foo"), r"C:\foo");
+        let drive_root = std::path::PathBuf::from(trim_windows_cwd(r"C:\"));
+        assert!(
+            drive_root.has_root(),
+            "C:\\ must stay an absolute root, got {drive_root:?}"
+        );
+        assert_ne!(
+            drive_root.as_os_str(),
+            std::ffi::OsStr::new("C:"),
+            "must not collapse to a drive-relative path"
+        );
+    }
+
+    #[test]
+    fn process_tree_sees_child_cwd_change() {
+        let target = std::env::temp_dir().join(format!(
+            "luvus-win-child-cwd-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(target.join(".git")).expect("child git cwd");
+        // Parent cmd starts in temp; the ping child is created in `target`.
+        // That is the pane-tree case: a descendant running in another git
+        // root. CREATE_NO_WINDOW: detached Luvus must not flash a console.
+        let mut child = crate::platform::no_window(
+            std::process::Command::new("cmd.exe")
+                .args(["/C", "ping.exe -n 20 127.0.0.1"])
+                .current_dir(&target)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+        )
+        .spawn()
+        .expect("spawn cmd child");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        let mut seen = None;
+        let mut last_status = None;
+        while std::time::Instant::now() < deadline {
+            last_status = child.try_wait().ok().flatten();
+            let scan = crate::platform::scan_pane_cwds(&[child.id()]);
+            if let Some(evidence) = scan.first() {
+                for cwd in [
+                    evidence.owner_cwd.as_ref(),
+                    evidence.descendant_git_cwd.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    if crate::platform::same_path(cwd, &target) {
+                        seen = Some(cwd.clone());
+                        break;
+                    }
+                }
+            }
+            if seen.is_some() {
+                break;
+            }
+            if last_status.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&target);
+        assert!(
+            seen.is_some(),
+            "process tree did not observe child cwd {target:?} status={last_status:?}"
         );
     }
 }

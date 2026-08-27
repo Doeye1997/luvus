@@ -479,9 +479,41 @@ impl App {
         // The file-viewer upkeep rides the same 1s cadence — sub-second freshness
         // buys nothing (a node switch or an on-disk edit showing within a second
         // is fine) and 10x/s stats + allocs would be wasted work on the loop.
-        if now.duration_since(self.last_cwd_at) >= Duration::from_secs(1) {
+        if now.duration_since(self.last_cwd_at) >= Duration::from_secs(1) && !self.cwd_scan_inflight
+        {
             self.last_cwd_at = now;
-            self.refresh_cwds();
+            self.cwd_scan_inflight = true;
+            let panes: Vec<(PaneId, u32)> = self
+                .panes
+                .iter()
+                .filter_map(|(id, p)| {
+                    let pid = p.child_pid.load(std::sync::atomic::Ordering::SeqCst);
+                    (pid != 0).then_some((*id, pid))
+                })
+                .collect();
+            let workspaces: Vec<(String, PathBuf)> = self
+                .workspaces
+                .iter()
+                .map(|ws| (ws.id.clone(), ws.cwd.clone()))
+                .collect();
+            let tx = self.app_tx.clone();
+            std::thread::spawn(move || {
+                let pids: Vec<u32> = panes.iter().map(|(_, pid)| *pid).collect();
+                let evidence = crate::platform::scan_pane_cwds(&pids);
+                let pane_results = panes
+                    .into_iter()
+                    .zip(evidence)
+                    .map(|((id, _), ev)| (id, ev))
+                    .collect();
+                let branches = workspaces
+                    .into_iter()
+                    .map(|(id, cwd)| (id, super::git_branch(&cwd)))
+                    .collect();
+                let _ = tx.send(AppEvent::CwdScanned {
+                    panes: pane_results,
+                    branches,
+                });
+            });
             // Keep the FILES dock rooted at the active node and its open dirs
             // read (docs/38). Off-loop: this only schedules reads, never blocks.
             self.ensure_file_tree();
