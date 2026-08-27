@@ -1479,4 +1479,67 @@ mod tests {
         assert!(capture.text.contains("next"), "{:?}", capture.text);
         assert!(capture.lines <= 3);
     }
+
+    /// Pi alt-screen `doRender`: 2026 + row writes + CUP to fake caret + hide.
+    #[test]
+    fn pi_sync_frame_cursor_follows_final_cup_not_row_tail() {
+        let (tx, _rx) = channel();
+        let mut e = AlacrittyEngine::new(20, 4, tx, budget_for_rows(20, 20));
+        // Row 0 full of x (last cell col 19). Row 1: "> " + reverse space + pad.
+        // Then CUP to row 1 col 2 (1-based 2;3) and hide — Pi marker after prompt.
+        e.advance(
+            b"\x1b[?2026h\
+\x1b[1;1H\x1b[2Kxxxxxxxxxxxxxxxxxxxx\
+\x1b[2;1H\x1b[2K> \x1b[7m \x1b[27m               \
+\x1b[2;3H\x1b[?25l\
+\x1b[?2026l",
+        );
+        let cur = e.cursor();
+        assert_eq!((cur.x, cur.y), (2, 1), "cursor after complete 2026 frame");
+        assert!(!cur.visible, "Pi default hide");
+
+        let mut reversed = Vec::new();
+        e.for_each_cell(&mut |row, col, _, cell| {
+            if cell.mods.contains(Modifier::REVERSED) {
+                reversed.push((row, col));
+            }
+        });
+        assert_eq!(reversed, vec![(1, 2)], "ESC[7m space at caret, not row tail");
+    }
+
+    #[test]
+    fn pi_sync_frame_without_closing_esu_does_not_apply_row_writes() {
+        let (tx, _rx) = channel();
+        let mut e = AlacrittyEngine::new(20, 4, tx, budget_for_rows(20, 20));
+        e.advance(b"\x1b[2;3H\x1b[?25h");
+        let before = e.cursor();
+        e.advance(b"\x1b[?2026h\x1b[1;1H\x1b[2Kxxxxxxxxxxxxxxxxxxxx");
+        let mid = e.cursor();
+        assert_eq!(
+            (mid.x, mid.y),
+            (before.x, before.y),
+            "open 2026 buffers; cursor stays at last committed CUP"
+        );
+    }
+
+    #[test]
+    fn pi_cursor_marker_apc_is_not_a_grid_cell() {
+        let (tx, _rx) = channel();
+        let mut e = AlacrittyEngine::new(20, 3, tx, budget_for_rows(20, 20));
+        e.advance(b"> \x1b_pi:c\x07\x1b[7m \x1b[27mhi");
+        let text = e.visible_rows().join("");
+        assert!(
+            !text.contains("pi:c"),
+            "APC marker must not become cells: {text:?}"
+        );
+        let mut reversed = Vec::new();
+        e.for_each_cell(&mut |row, col, _, cell| {
+            if cell.mods.contains(Modifier::REVERSED) {
+                reversed.push((row, col, cell.fg));
+            }
+        });
+        assert_eq!(reversed.len(), 1, "one reverse caret: {reversed:?}");
+        assert_eq!(reversed[0].0, 0);
+        assert_eq!(reversed[0].1, 2);
+    }
 }

@@ -191,8 +191,8 @@ where
     // Main thread: paint frames as they arrive. A full frame repaints the screen; a
     // diff writes only its changed cells straight to the terminal (no full re-blit,
     // no reconstructed frame) — so a busy session costs O(changed cells), not O(screen).
-    // `last_cursor` is the last pane caret: spinner diffs often hide the cursor, and
-    // Windows IME follows the hardware cursor left on the last drawn cell.
+    // `last_cursor` parks IME when this frame hid the PTY caret (herdr: CUP off
+    // chrome even when the pane requested ?25l).
     let mut last_cursor = None;
     let exit = loop {
         match protocol::read_message::<_, ServerMessage>(&mut reader) {
@@ -205,6 +205,7 @@ where
                     terminal,
                     &frame_cells(&frame, truecolor),
                     frame.cursor,
+                    frame.cursor_visible,
                     true,
                     &mut last_cursor,
                 );
@@ -225,6 +226,7 @@ where
                     terminal,
                     &diff_cells(&diff, truecolor),
                     diff.cursor,
+                    diff.cursor_visible,
                     false,
                     &mut last_cursor,
                 );
@@ -493,36 +495,24 @@ fn diff_cells(diff: &FrameDiff, truecolor: bool) -> Vec<(u16, u16, Cell)> {
     cells
 }
 
-/// Windows IME follows this caret. Chat agents (Pi) leave the PTY cursor on the
-/// tab row while thinking; Grok keeps it in the prompt. On a tall screen, a caret
-/// on the top two rows is moved to the prompt line above the status bar.
-fn ime_position(
-    cursor: Option<(u16, u16)>,
-    last_cursor: Option<(u16, u16)>,
-    tw: u16,
-    th: u16,
-) -> Option<(u16, u16)> {
-    let visible = cursor.filter(|(x, y)| *x < tw && *y < th);
-    let (x, y) = visible.or(last_cursor.filter(|(x, y)| *x < tw && *y < th))?;
-    let y = if th > 8 && y <= 1 {
-        th.saturating_sub(2)
-    } else {
-        y
-    };
-    Some((x.min(tw.saturating_sub(1)), y))
+/// Visible in-bounds pane cell. Does not remap a compact/mobile row-0/1 caret
+/// onto the status line, and does not invent a prompt row.
+fn ime_position(cursor: Option<(u16, u16)>, tw: u16, th: u16) -> Option<(u16, u16)> {
+    cursor.filter(|(x, y)| *x < tw && *y < th)
 }
 
 /// Write `cells` straight to the terminal via the backend (no full re-blit / no
 /// ratatui double-buffer), position the cursor, and flush. `clear` first wipes the
 /// screen (full frame / resync); diffs paint over what's already there.
 ///
-/// `last_cursor` is the last in-bounds pane caret. A working-spinner diff draws
-/// bar cells and often arrives with `cursor: None`; the caret is shown there so
-/// Windows IME composition stays on the prompt instead of the bar or nowhere.
+/// Herdr blit: hide, write cells, CUP to pane PTY (hidden still parks), then
+/// show/hide. `backend.draw` walks the hardware cursor onto the last cell
+/// (e.g. a `working` spinner); IME must not observe that cell.
 fn paint<B>(
     terminal: &mut Terminal<B>,
     cells: &[(u16, u16, Cell)],
     cursor: Option<(u16, u16)>,
+    cursor_visible: bool,
     clear: bool,
     last_cursor: &mut Option<(u16, u16)>,
 ) -> Result<()>
@@ -534,6 +524,7 @@ where
     let size = terminal.size()?;
     let (tw, th) = (size.width, size.height);
     let backend = terminal.backend_mut();
+    backend.hide_cursor()?;
     if clear {
         backend.clear()?;
     }
@@ -543,17 +534,24 @@ where
             .filter(|(x, y, _)| *x < tw && *y < th)
             .map(|(x, y, c)| (*x, *y, c)),
     )?;
-    if let Some((x, y)) = cursor {
-        if x < tw && y < th {
-            *last_cursor = Some((x, y));
-        }
-    }
-    match ime_position(cursor, *last_cursor, tw, th) {
+    match ime_position(cursor, tw, th) {
         Some((x, y)) => {
+            *last_cursor = Some((x, y));
             backend.set_cursor_position(Position::new(x, y))?;
-            backend.show_cursor()?;
+            if cursor_visible {
+                backend.show_cursor()?;
+            } else {
+                backend.hide_cursor()?;
+            }
         }
-        None => backend.hide_cursor()?,
+        None => {
+            if let Some((x, y)) = *last_cursor {
+                if x < tw && y < th {
+                    backend.set_cursor_position(Position::new(x, y))?;
+                }
+            }
+            backend.hide_cursor()?;
+        }
     }
     backend.flush()?;
     Ok(())
@@ -587,6 +585,7 @@ mod tests {
             height: 1,
             cells: vec![c("\u{1F534}"), c(""), c("A"), c("B")],
             cursor: None,
+            cursor_visible: false,
         };
         let cells = super::frame_cells(&frame, true);
         let syms: Vec<(u16, String)> = cells
@@ -916,12 +915,14 @@ mod render_tests {
             height: 1,
             cells: vec![cell("a"), cell("b"), cell("c")],
             cursor: None,
+            cursor_visible: false,
         };
         let f1 = FrameData {
             width: 3,
             height: 1,
             cells: vec![cell("a"), cell("X"), cell("c")],
             cursor: Some((1, 0)),
+            cursor_visible: true,
         };
 
         let mut term = Terminal::new(TestBackend::new(3, 1)).unwrap();
@@ -931,6 +932,7 @@ mod render_tests {
             &mut term,
             &frame_cells(&f0, true),
             f0.cursor,
+            f0.cursor_visible,
             true,
             &mut last_cursor,
         )
@@ -940,11 +942,13 @@ mod render_tests {
             height: 1,
             runs: protocol::diff_runs(&f0, &f1),
             cursor: f1.cursor,
+            cursor_visible: f1.cursor_visible,
         };
         paint(
             &mut term,
             &diff_cells(&diff, true),
             diff.cursor,
+            diff.cursor_visible,
             false,
             &mut last_cursor,
         )
@@ -952,7 +956,7 @@ mod render_tests {
 
         // The terminal now shows f1 — the client stays correct without ever
         // re-blitting the whole frame.
-        let got = protocol::frame_from_buffer(term.backend().buffer(), None);
+        let got = protocol::frame_from_buffer(term.backend().buffer(), None, false);
         assert_eq!(got.cells, f1.cells);
     }
 }
@@ -975,49 +979,53 @@ mod paint_tests {
     }
 
     #[test]
-    fn hidden_cursor_stays_on_pane_after_bar_spinner_diff() {
-        let mut term = Terminal::new(TestBackend::new(8, 2)).unwrap();
-        let mut last = None;
-        let mut cells = vec![cell(" "); 16];
+    fn pty_visible_cursor_is_restored_after_spinner_like_diff() {
+        let mut term = Terminal::new(TestBackend::new(8, 8)).unwrap();
+        let mut cells = vec![cell(" "); 64];
         let f0 = FrameData {
             width: 8,
-            height: 2,
+            height: 8,
             cells: cells.clone(),
-            cursor: Some((1, 0)),
+            cursor: Some((1, 4)),
+            cursor_visible: true,
         };
+        let mut last = None;
         paint(
             &mut term,
             &super::frame_cells(&f0, true),
             f0.cursor,
+            f0.cursor_visible,
             true,
             &mut last,
         )
         .unwrap();
-        assert_eq!(last, Some((1, 0)));
 
         // Crossterm's draw walks the hardware cursor onto each cell. TestBackend
         // does not, so park it on the bottom-right spinner cell the same way.
         term.backend_mut()
-            .set_cursor_position(Position::new(7, 1))
+            .set_cursor_position(Position::new(7, 7))
             .unwrap();
 
-        cells[15] = cell("*");
+        cells[63] = cell("*");
         let f1 = FrameData {
             width: 8,
-            height: 2,
+            height: 8,
             cells,
-            cursor: None,
+            cursor: Some((1, 4)),
+            cursor_visible: true,
         };
         let diff = FrameDiff {
             width: 8,
-            height: 2,
+            height: 8,
             runs: protocol::diff_runs(&f0, &f1),
-            cursor: None,
+            cursor: Some((1, 4)),
+            cursor_visible: true,
         };
         paint(
             &mut term,
             &super::diff_cells(&diff, true),
             diff.cursor,
+            diff.cursor_visible,
             false,
             &mut last,
         )
@@ -1025,58 +1033,138 @@ mod paint_tests {
 
         assert_eq!(
             term.backend_mut().get_cursor_position().unwrap(),
-            Position::new(1, 0)
+            Position::new(1, 4)
         );
         assert!(term.backend().cursor_visible());
     }
 
     #[test]
-    fn out_of_bounds_cursor_keeps_visible_caret_on_last_pane_cell() {
-        let mut term = Terminal::new(TestBackend::new(8, 2)).unwrap();
-        let mut last = None;
-        let cells = vec![cell(" "); 16];
+    fn hidden_pty_cursor_does_not_show_a_luvus_caret() {
+        let mut term = Terminal::new(TestBackend::new(8, 8)).unwrap();
+        let mut cells = vec![cell(" "); 64];
         let f0 = FrameData {
             width: 8,
-            height: 2,
+            height: 8,
             cells: cells.clone(),
-            cursor: Some((1, 0)),
+            cursor: Some((1, 4)),
+            cursor_visible: true,
+        };
+        let mut last = None;
+        paint(
+            &mut term,
+            &super::frame_cells(&f0, true),
+            f0.cursor,
+            f0.cursor_visible,
+            true,
+            &mut last,
+        )
+        .unwrap();
+        assert!(term.backend().cursor_visible());
+
+        term.backend_mut()
+            .set_cursor_position(Position::new(7, 7))
+            .unwrap();
+
+        cells[63] = cell("*");
+        let f1 = FrameData {
+            width: 8,
+            height: 8,
+            cells,
+            cursor: Some((1, 4)),
+            cursor_visible: false,
+        };
+        let diff = FrameDiff {
+            width: 8,
+            height: 8,
+            runs: protocol::diff_runs(&f0, &f1),
+            cursor: Some((1, 4)),
+            cursor_visible: false,
+        };
+        paint(
+            &mut term,
+            &super::diff_cells(&diff, true),
+            diff.cursor,
+            diff.cursor_visible,
+            false,
+            &mut last,
+        )
+        .unwrap();
+
+        assert_eq!(
+            term.backend_mut().get_cursor_position().unwrap(),
+            Position::new(1, 4)
+        );
+        assert!(!term.backend().cursor_visible());
+    }
+
+    #[test]
+    fn out_of_bounds_cursor_hides_caret() {
+        let mut term = Terminal::new(TestBackend::new(8, 8)).unwrap();
+        let mut last = None;
+        let cells = vec![cell(" "); 64];
+        let f0 = FrameData {
+            width: 8,
+            height: 8,
+            cells,
+            cursor: Some((1, 4)),
+            cursor_visible: true,
         };
         paint(
             &mut term,
             &super::frame_cells(&f0, true),
             f0.cursor,
+            f0.cursor_visible,
             true,
             &mut last,
         )
         .unwrap();
 
-        paint(&mut term, &[], Some((99, 99)), false, &mut last).unwrap();
+        paint(&mut term, &[], Some((99, 99)), false, false, &mut last).unwrap();
 
-        assert_eq!(last, Some((1, 0)));
         assert_eq!(
             term.backend_mut().get_cursor_position().unwrap(),
-            Position::new(1, 0)
+            Position::new(1, 4)
         );
-        assert!(term.backend().cursor_visible());
+        assert!(!term.backend().cursor_visible());
     }
 
     #[test]
-    fn tab_row_caret_moves_to_prompt_line_on_a_tall_screen() {
+    fn hidden_in_view_pty_parks_without_showing() {
+        let mut term = Terminal::new(TestBackend::new(8, 8)).unwrap();
+        let mut last = None;
+        let cells = vec![cell(" "); 64];
+        let f0 = FrameData {
+            width: 8,
+            height: 8,
+            cells,
+            cursor: Some((3, 5)),
+            cursor_visible: false,
+        };
+        paint(
+            &mut term,
+            &super::frame_cells(&f0, true),
+            f0.cursor,
+            f0.cursor_visible,
+            true,
+            &mut last,
+        )
+        .unwrap();
+
         assert_eq!(
-            super::ime_position(Some((3, 0)), None, 80, 24),
-            Some((3, 22))
+            term.backend_mut().get_cursor_position().unwrap(),
+            Position::new(3, 5)
         );
-        assert_eq!(
-            super::ime_position(Some((3, 1)), None, 80, 24),
-            Some((3, 22))
-        );
+        assert!(!term.backend().cursor_visible());
+    }
+
+    #[test]
+    fn tab_row_caret_stays_put_on_a_tall_screen() {
+        assert_eq!(super::ime_position(Some((3, 0)), 80, 24), Some((3, 0)));
+        assert_eq!(super::ime_position(Some((3, 1)), 80, 24), Some((3, 1)));
     }
 
     #[test]
     fn grok_prompt_caret_stays_put() {
-        assert_eq!(
-            super::ime_position(Some((4, 20)), None, 80, 24),
-            Some((4, 20))
-        );
+        assert_eq!(super::ime_position(Some((4, 20)), 80, 24), Some((4, 20)));
     }
 }
