@@ -191,8 +191,8 @@ where
     // Main thread: paint frames as they arrive. A full frame repaints the screen; a
     // diff writes only its changed cells straight to the terminal (no full re-blit,
     // no reconstructed frame) — so a busy session costs O(changed cells), not O(screen).
-    // `last_cursor` parks IME when this frame hid the PTY caret (herdr: CUP off
-    // chrome even when the pane requested ?25l).
+    // `last_cursor` parks IME when this frame hid the PTY caret: CUP onto the
+    // pane even after `?25l`, so composition does not follow chrome.
     let mut last_cursor = None;
     let exit = loop {
         match protocol::read_message::<_, ServerMessage>(&mut reader) {
@@ -505,9 +505,9 @@ fn ime_position(cursor: Option<(u16, u16)>, tw: u16, th: u16) -> Option<(u16, u1
 /// ratatui double-buffer), position the cursor, and flush. `clear` first wipes the
 /// screen (full frame / resync); diffs paint over what's already there.
 ///
-/// Herdr blit: hide, write cells, CUP to pane PTY (hidden still parks), then
-/// show/hide. `backend.draw` walks the hardware cursor onto the last cell
-/// (e.g. a `working` spinner); IME must not observe that cell.
+/// Hide, write cells, CUP to the pane PTY (hidden still parks), then show/hide.
+/// `backend.draw` walks the hardware cursor onto the last cell (e.g. a
+/// `working` spinner); IME must not observe that cell.
 fn paint<B>(
     terminal: &mut Terminal<B>,
     cells: &[(u16, u16, Cell)],

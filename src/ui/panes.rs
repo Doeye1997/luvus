@@ -308,11 +308,17 @@ fn draw_one_pane(
             let selection_top = sel
                 .and_then(|selection| selection.retained)
                 .map(|_| engine.history_len().saturating_sub(engine.scroll_offset()));
+            let cur = engine.cursor();
+            let scan_pi = agent == "pi";
+            let mut pi_caret: Option<(u16, u16)> = None;
             {
                 let buf = f.buffer_mut();
                 engine.for_each_cell(&mut |row, col, sym, cell| {
                     if row >= content.height || col >= content.width {
                         return;
+                    }
+                    if scan_pi && cell.mods.contains(ratatui::style::Modifier::REVERSED) {
+                        pi_caret = Some(pick_bottom_left_caret(pi_caret, (row, col)));
                     }
                     let x = content.x + col;
                     let y = content.y + row;
@@ -409,10 +415,9 @@ fn draw_one_pane(
             if is_codex {
                 composer_region = engine.codex_composer_region();
             }
-            let cur = engine.cursor();
             if focused && copy.is_none() {
-                if agent == "pi" {
-                    pi_ime_cursor(content, &*engine, cur)
+                if let Some((row, col)) = pi_caret {
+                    Some((content.x + col, content.y + row, true))
                 } else {
                     pane_ime_cursor(content, cur)
                 }
@@ -471,10 +476,7 @@ fn draw_one_pane(
 
 /// In-view PTY cell, mapped into the pane. Hidden still returns a park so the
 /// client can CUP after chrome.
-fn pane_ime_cursor(
-    content: Rect,
-    cur: crate::terminal::vt::Cursor,
-) -> Option<(u16, u16, bool)> {
+fn pane_ime_cursor(content: Rect, cur: crate::terminal::vt::Cursor) -> Option<(u16, u16, bool)> {
     if content.width == 0 || content.height == 0 {
         return None;
     }
@@ -484,31 +486,12 @@ fn pane_ime_cursor(
     Some((content.x + cur.x, content.y + cur.y, cur.visible))
 }
 
-/// Pi paints a reverse-video fake caret (`ESC[7m`) at `CURSOR_MARKER`.
-/// Bottom-most then leftmost reversed cell is that caret. Show the host
-/// cursor there so IME preedit has a visible block; `?25l` would leave
-/// composition un-inverted over the fake caret.
-fn pi_ime_cursor(
-    content: Rect,
-    engine: &dyn crate::terminal::vt::VtEngine,
-    cur: crate::terminal::vt::Cursor,
-) -> Option<(u16, u16, bool)> {
-    let mut caret: Option<(u16, u16)> = None;
-    engine.for_each_cell(&mut |row, col, _, cell| {
-        if !cell.mods.contains(ratatui::style::Modifier::REVERSED) {
-            return;
-        }
-        if col >= content.width || row >= content.height {
-            return;
-        }
-        caret = Some(pick_bottom_left_caret(caret, (row, col)));
-    });
-    if let Some((row, col)) = caret {
-        return Some((content.x + col, content.y + row, true));
-    }
-    pane_ime_cursor(content, cur)
-}
-
+/// Pi's `CURSOR_MARKER` (`ESC_pi:c BEL`) is stripped in `extractCursorPosition`
+/// before the PTY write, so Luvus never sees a direct marker. Hidden PTY CUP is
+/// often out of view or on the row tail while working. Bottom-most then leftmost
+/// reverse-video cell in this pane is the fake caret (`ESC[7m`). Show the host
+/// cursor there so IME preedit has a block; without this park the hardware
+/// cursor stays on the last painted cell (the `working` spinner).
 fn pick_bottom_left_caret(current: Option<(u16, u16)>, cell: (u16, u16)) -> (u16, u16) {
     match current {
         None => cell,

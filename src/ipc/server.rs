@@ -919,8 +919,7 @@ fn render_client(
         ))
     } else {
         let previous = client.last_frame.as_mut().expect("frame baseline exists");
-        let cursor_moved =
-            previous.cursor != cursor || previous.cursor_visible != cursor_visible;
+        let cursor_moved = previous.cursor != cursor || previous.cursor_visible != cursor_visible;
         let runs = protocol::diff_buffer(previous, &client.render_buf);
         previous.cursor = cursor;
         previous.cursor_visible = cursor_visible;

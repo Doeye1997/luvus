@@ -1504,7 +1504,11 @@ mod tests {
                 reversed.push((row, col));
             }
         });
-        assert_eq!(reversed, vec![(1, 2)], "ESC[7m space at caret, not row tail");
+        assert_eq!(
+            reversed,
+            vec![(1, 2)],
+            "ESC[7m space at caret, not row tail"
+        );
     }
 
     #[test]
