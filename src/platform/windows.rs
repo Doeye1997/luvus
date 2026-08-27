@@ -339,7 +339,7 @@ struct UnicodeString {
     buffer: *mut u16,
 }
 
-fn read_process_memory<T: Copy>(process: HANDLE, addr: *const core::ffi::c_void) -> Option<T> {
+fn read_process_memory_copy<T: Copy>(process: HANDLE, addr: *const core::ffi::c_void) -> Option<T> {
     let mut out = std::mem::MaybeUninit::<T>::uninit();
     let mut read = 0_usize;
     // SAFETY: `out` is writable for `size_of::<T>()` and `addr` is a pointer
@@ -386,7 +386,7 @@ pub(super) fn process_cwd(pid: u32) -> Option<std::path::PathBuf> {
     if status != 0 || info.peb_base_address.is_null() {
         return None;
     }
-    let params: *mut core::ffi::c_void = read_process_memory(
+    let params: *mut core::ffi::c_void = read_process_memory_copy(
         handle.0,
         (info.peb_base_address as usize + PEB_PROCESS_PARAMETERS) as *const _,
     )?;
@@ -394,7 +394,7 @@ pub(super) fn process_cwd(pid: u32) -> Option<std::path::PathBuf> {
         return None;
     }
     let dos: UnicodeString =
-        read_process_memory(handle.0, (params as usize + RTL_CURRENT_DIRECTORY) as *const _)?;
+        read_process_memory_copy(handle.0, (params as usize + RTL_CURRENT_DIRECTORY) as *const _)?;
     if dos.buffer.is_null() || dos.length < 2 {
         return None;
     }

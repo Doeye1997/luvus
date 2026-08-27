@@ -614,15 +614,6 @@ fn is_system_cwd(cwd: &Path) -> bool {
         || key.starts_with("c:\\programdata")
 }
 
-/// Cheap filesystem probe: a `.git` dir/file in `cwd` or a parent. No `git`
-/// subprocess — home folders like `C:\Users\Administrator` must not block the
-/// UI thread on `git rev-parse`.
-pub fn has_git_ancestor(cwd: &Path) -> bool {
-    cwd.ancestors()
-        .take(8)
-        .any(|dir| dir.join(".git").exists())
-}
-
 /// Raise the OS timer resolution so the event loop's timed waits (`recv_timeout`,
 /// `thread::sleep`) actually run at their intended cadence. Windows' default
 /// scheduler tick is ~15.6 ms, which quantizes those waits and makes the render
