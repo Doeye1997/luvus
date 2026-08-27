@@ -773,14 +773,9 @@ mod windows_security_tests {
     #[test]
     fn connect_timeout_times_out_when_every_instance_is_busy() {
         let path = test_pipe("busy-timeout");
-        let listener = bind(&path).expect("bind owner-only named pipe");
-        let occupied_path = path.clone();
-        let occupied = std::thread::spawn(move || connect(&occupied_path));
-        let _peer = listener.accept().expect("accept occupying client");
-        let first = occupied
-            .join()
-            .expect("occupying connect")
-            .expect("occupying client");
+        let _listener = bind(&path).expect("bind owner-only named pipe");
+        let first = connect_timeout(&path, Duration::from_millis(200))
+            .expect("first client occupies the free instance");
         let started = std::time::Instant::now();
         let result = connect_timeout(&path, Duration::from_millis(200));
         assert!(
@@ -789,10 +784,8 @@ mod windows_security_tests {
         );
         match result {
             Err(error) if error.kind() == io::ErrorKind::TimedOut => {}
-            Ok(_) => {
-                // Listener may have created another instance; still must be fast.
-            }
-            Err(error) => panic!("unexpected connect_timeout error: {error}"),
+            Ok(_) => panic!("busy pipe must time out, got a connection"),
+            Err(error) => panic!("busy pipe must time out, got {error}"),
         }
         drop(first);
     }

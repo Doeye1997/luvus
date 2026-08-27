@@ -1251,6 +1251,44 @@ mod tests {
     }
 
     #[test]
+    fn send_server_stop_fails_closed_when_a_listener_never_replies() {
+        let _env = crate::persist::test_env("stop-mute-accept");
+        crate::persist::ensure_session_dir();
+        let _listener =
+            crate::ipc::transport::bind(&crate::persist::socket_path()).expect("mute API listener");
+        let started = Instant::now();
+        let result = send_server_stop();
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "mute accept must not hang server stop"
+        );
+        assert!(
+            result.is_err(),
+            "fail closed without a stoppable foreign pid: {result:?}"
+        );
+    }
+
+    #[test]
+    fn ensure_server_ready_fails_closed_when_control_ping_never_replies() {
+        let _env = crate::persist::test_env("ready-mute-accept");
+        crate::persist::ensure_session_dir();
+        let client = crate::persist::client_socket_path();
+        let api = crate::persist::socket_path();
+        let _client_listener = crate::ipc::transport::bind(&client).expect("mute client listener");
+        let _api_listener = crate::ipc::transport::bind(&api).expect("mute API listener");
+        let started = Instant::now();
+        let result = ensure_server_ready(&client);
+        assert!(
+            started.elapsed() < Duration::from_secs(6),
+            "mute ping must not hang attach"
+        );
+        assert!(
+            result.is_err(),
+            "fail closed rather than attach to a mute loop: {result:?}"
+        );
+    }
+
+    #[test]
     fn only_exact_json_session_list_uses_discovery_route() {
         let strings = |items: &[&str]| {
             items
