@@ -11137,6 +11137,14 @@ mod tests {
 mod cwd_test {
     use super::*;
 
+    // Live `cd` through Windows PowerShell does not reliably update the PEB
+    // directory this reader uses. Windows coverage is process_cwd_matches_this_process
+    // plus the rehome tests below.
+    #[cfg(unix)]
+    // Live `cd` through Windows PowerShell does not reliably update the PEB
+    // directory this reader uses. Windows coverage is process_cwd_matches_this_process
+    // plus the rehome tests below.
+    #[cfg(unix)]
     #[test]
     fn pane_cwd_follows_cd_without_moving_its_workspace() {
         let _env = crate::persist::test_env("pane-cwd-follows-cd");
