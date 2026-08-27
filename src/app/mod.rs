@@ -3655,7 +3655,9 @@ impl App {
     /// Open the workspace context menu for row `index`, anchored at the cursor.
     pub fn open_ws_menu(&mut self, index: usize, col: u16, row: u16) {
         if index < self.workspaces.len() {
-            let is_repo = crate::git::local::is_repo(&self.workspaces[index].cwd);
+            let cwd = &self.workspaces[index].cwd;
+            let is_repo =
+                crate::platform::has_git_ancestor(cwd) && crate::git::local::is_repo(cwd);
             self.ws_menu = Some(WsMenu {
                 workspace_id: self.workspaces[index].id.clone(),
                 is_repo,
@@ -3680,7 +3682,11 @@ impl App {
             .map(|menu| menu.is_repo)
             // Keep this helper useful to callers that inspect rows before
             // opening a menu. The renderer always takes the cached branch.
-            .unwrap_or_else(|| ws.is_some_and(|w| crate::git::local::is_repo(&w.cwd)));
+            .unwrap_or_else(|| {
+                ws.is_some_and(|w| {
+                    crate::platform::has_git_ancestor(&w.cwd) && crate::git::local::is_repo(&w.cwd)
+                })
+            });
         // A linked worktree (a `git worktree add` checkout) can be deleted; a main
         // checkout or plain workspace cannot — only closed.
         let is_worktree = ws
@@ -5419,6 +5425,9 @@ fn worktrees_dir_for(repo: &std::path::Path) -> PathBuf {
 /// Worktree grouping for a workspace at `cwd` (docs/18 WT): its git common dir, if
 /// `cwd` is inside a repo. Workspaces that share one group together in the sidebar.
 fn worktree_membership(cwd: &std::path::Path) -> Option<crate::git::WorktreeMembership> {
+    if !crate::platform::has_git_ancestor(cwd) {
+        return None;
+    }
     crate::git::local::common_dir(cwd).map(|common_dir| {
         // A *linked* worktree's common dir lives in the repo's main working tree,
         // so it is never inside this checkout's own folder. `common_dir` is

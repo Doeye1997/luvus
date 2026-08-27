@@ -24,6 +24,15 @@ pub fn same_path(a: &Path, b: &Path) -> bool {
     path_key(a) == path_key(b)
 }
 
+/// Cheap filesystem probe: a `.git` dir/file in `cwd` or a parent. No `git`
+/// subprocess — home folders like `C:\\Users\\Administrator` must not block the
+/// UI thread on `git rev-parse`.
+pub fn has_git_ancestor(cwd: &Path) -> bool {
+    cwd.ancestors()
+        .take(8)
+        .any(|dir| dir.join(".git").exists())
+}
+
 /// The comparison key for [`same_path`] — normalized spelling, never displayed.
 /// The node keeps the user's original spelling for its label and pane cwd.
 fn path_key(p: &Path) -> String {
@@ -725,6 +734,17 @@ mod tests {
         assert_eq!(super::resolve_shell("default"), "/bin/sh");
         assert_eq!(super::resolve_shell("zsh"), "/bin/sh");
         std::env::remove_var("LUVUS_SHELL");
+    }
+
+    #[test]
+    fn home_folder_without_git_is_not_a_repo_probe() {
+        assert!(
+            !super::has_git_ancestor(std::path::Path::new(r"C:\Users\Administrator")),
+            "Administrator home must not trigger git on the UI thread"
+        );
+        assert!(super::has_git_ancestor(std::path::Path::new(
+            r"F:\Project\claude\skills"
+        )));
     }
 
     #[test]
