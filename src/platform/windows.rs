@@ -4,6 +4,7 @@
 //! contract as macOS/Linux without carrying Windows handles through app state.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::c_void;
 use std::mem::size_of;
 
 use windows_sys::Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation};
@@ -46,6 +47,23 @@ impl Drop for OwnedHandle {
 fn open_process(pid: u32) -> Option<OwnedHandle> {
     // SAFETY: the access mask is read-only and `pid` is passed by value.
     OwnedHandle::new(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) })
+}
+
+fn read_process_memory<T>(process: HANDLE, address: *const c_void) -> Option<T> {
+    let mut value = std::mem::MaybeUninit::<T>::uninit();
+    let mut bytes_read = 0;
+    // SAFETY: `address` is supplied by the target process and is only read via
+    // the OS API; `value` is writable storage of the exact requested size.
+    let success = unsafe {
+        ReadProcessMemory(
+            process,
+            address,
+            value.as_mut_ptr().cast(),
+            size_of::<T>(),
+            &mut bytes_read,
+        )
+    } != 0;
+    (success && bytes_read == size_of::<T>()).then(|| unsafe { value.assume_init() })
 }
 
 /// Read a process's full command line from its PEB.
@@ -303,6 +321,13 @@ pub(super) fn descendant_commands(roots: &[u32]) -> Option<HashMap<u32, Vec<Stri
     )
 }
 
+#[repr(C)]
+struct UnicodeString {
+    length: u16,
+    _maximum_length: u16,
+    buffer: *mut u16,
+}
+
 /// Another process's current directory via its PEB. Used so a workspace can
 /// follow a pane whose agent `chdir`'d in a child (Pi on Windows).
 #[cfg(target_pointer_width = "64")]
@@ -329,16 +354,17 @@ pub(super) fn process_cwd(pid: u32) -> Option<std::path::PathBuf> {
     if peb.ProcessParameters.is_null() {
         return None;
     }
-    let parameters = read_process_memory::<RTL_USER_PROCESS_PARAMETERS>(
+    // windows-sys omits CURDIR; DosPath sits at 0x38 in the x64 parameter block.
+    const RTL_CURRENT_DIRECTORY: usize = 0x38;
+    let dos = read_process_memory::<UnicodeString>(
         process.0,
-        peb.ProcessParameters.cast(),
+        (peb.ProcessParameters as usize + RTL_CURRENT_DIRECTORY) as *const c_void,
     )?;
-    let dos = parameters.CurrentDirectory.DosPath;
-    let length = usize::from(dos.Length);
+    let length = usize::from(dos.length);
     if length < 2 || length % size_of::<u16>() != 0 || length > 4096 * size_of::<u16>() {
         return None;
     }
-    if dos.Buffer.is_null() {
+    if dos.buffer.is_null() {
         return None;
     }
     let mut buffer = vec![0_u16; length / size_of::<u16>()];
@@ -347,7 +373,7 @@ pub(super) fn process_cwd(pid: u32) -> Option<std::path::PathBuf> {
     let success = unsafe {
         ReadProcessMemory(
             process.0,
-            dos.Buffer.cast(),
+            dos.buffer.cast(),
             buffer.as_mut_ptr().cast(),
             length,
             &mut bytes_read,

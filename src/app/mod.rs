@@ -4691,7 +4691,10 @@ impl App {
                 let Some(root) = crate::platform::git_root(&pane.cwd) else {
                     continue;
                 };
-                if roots.iter().any(|cwd| crate::platform::same_path(cwd, &root)) {
+                if roots
+                    .iter()
+                    .any(|cwd| crate::platform::same_path(cwd, &root))
+                {
                     continue;
                 }
                 roots.push(root);
@@ -11200,7 +11203,10 @@ mod cwd_test {
         );
         let pane = app.layout().focus;
         let (src, _, _) = app.pane_tab_home(pane).expect("pane has a tab");
-        assert_eq!(app.workspaces[src].cwd, other, "spawned in the new workspace");
+        assert_eq!(
+            app.workspaces[src].cwd, other,
+            "spawned in the new workspace"
+        );
         app.panes.get_mut(&pane).unwrap().cwd = home.clone();
         app.rehome_panes_by_cwd();
         let (dest, _, _) = app.pane_tab_home(pane).expect("pane still has a tab");
@@ -11222,9 +11228,7 @@ mod cwd_test {
             std::process::id(),
             pane.0
         ));
-        if crate::platform::same_path(&spawn, &repo)
-            || crate::platform::is_subpath(&repo, &spawn)
-        {
+        if crate::platform::same_path(&spawn, &repo) || crate::platform::is_subpath(&repo, &spawn) {
             return;
         }
         std::fs::create_dir_all(repo.join(".git")).expect("fake git root");
