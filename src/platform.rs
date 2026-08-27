@@ -605,13 +605,19 @@ fn is_system_cwd(cwd: &Path) -> bool {
         || key.starts_with("c:\\programdata")
 }
 
-/// Cheap filesystem probe: a `.git` dir/file in `cwd` or a parent. No `git`
+/// Nearest `.git` dir/file in `cwd` or a parent, capped at 8 ancestors. No `git`
 /// subprocess — home folders like `C:\Users\Administrator` must not block the
 /// UI thread on `git rev-parse`.
-pub fn has_git_ancestor(cwd: &Path) -> bool {
+pub fn git_root(cwd: &Path) -> Option<PathBuf> {
     cwd.ancestors()
         .take(8)
-        .any(|dir| dir.join(".git").exists())
+        .find(|dir| dir.join(".git").exists())
+        .map(|dir| dir.to_path_buf())
+}
+
+/// Cheap filesystem probe: a `.git` dir/file in `cwd` or a parent.
+pub fn has_git_ancestor(cwd: &Path) -> bool {
+    git_root(cwd).is_some()
 }
 
 /// Raise the OS timer resolution so the event loop's timed waits (`recv_timeout`,
