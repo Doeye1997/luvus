@@ -33,6 +33,15 @@ pub fn has_git_ancestor(cwd: &Path) -> bool {
         .any(|dir| dir.join(".git").exists())
 }
 
+/// True when `child` is `parent` or a folder inside it (docs/43 WIN-6 spelling).
+pub fn is_subpath(child: &Path, parent: &Path) -> bool {
+    let child = path_key(child);
+    let parent = path_key(parent);
+    child == parent
+        || child.starts_with(&format!("{parent}\\"))
+        || child.starts_with(&format!("{parent}/"))
+}
+
 /// The comparison key for [`same_path`] — normalized spelling, never displayed.
 /// The node keeps the user's original spelling for its label and pane cwd.
 fn path_key(p: &Path) -> String {
@@ -270,7 +279,12 @@ pub fn process_cwd(pid: u32) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(windows)]
+pub fn process_cwd(pid: u32) -> Option<PathBuf> {
+    windows::process_cwd(pid)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 pub fn process_cwd(_pid: u32) -> Option<PathBuf> {
     None
 }
@@ -548,6 +562,65 @@ pub fn process_tree(root: u32) -> Vec<ProcInfo> {
 #[cfg(not(any(unix, windows)))]
 pub fn process_tree(_root: u32) -> Vec<ProcInfo> {
     Vec::new()
+}
+
+/// Live cwd of a pane's process tree. The PTY child is usually a shell;
+/// agents (Pi, Claude, …) `chdir` in a descendant, so a project directory in
+/// that tree is where the user is actually working. Windows helper processes
+/// often sit in `C:\Windows`; those are skipped so they cannot steal mapping.
+pub fn process_tree_cwd(root: u32) -> Option<PathBuf> {
+    let tree = process_tree(root);
+    if tree.is_empty() {
+        return process_cwd(root).filter(|cwd| !is_system_cwd(cwd));
+    }
+    let mut root_cwd = None;
+    let mut best_git: Option<(u16, PathBuf)> = None;
+    let mut best_any: Option<(u16, PathBuf)> = None;
+    for proc in tree {
+        let Some(cwd) = process_cwd(proc.pid) else {
+            continue;
+        };
+        if is_system_cwd(&cwd) {
+            continue;
+        }
+        if proc.depth == 0 {
+            root_cwd = Some(cwd.clone());
+        }
+        if has_git_ancestor(&cwd)
+            && best_git
+                .as_ref()
+                .is_none_or(|(depth, _)| proc.depth >= *depth)
+        {
+            best_git = Some((proc.depth, cwd.clone()));
+        }
+        if best_any
+            .as_ref()
+            .is_none_or(|(depth, _)| proc.depth >= *depth)
+        {
+            best_any = Some((proc.depth, cwd));
+        }
+    }
+    best_git
+        .map(|(_, cwd)| cwd)
+        .or(root_cwd)
+        .or(best_any.map(|(_, cwd)| cwd))
+}
+
+fn is_system_cwd(cwd: &Path) -> bool {
+    let key = path_key(cwd);
+    key == "c:\\windows"
+        || key.starts_with("c:\\windows\\")
+        || key.starts_with("c:\\program files")
+        || key.starts_with("c:\\programdata")
+}
+
+/// Cheap filesystem probe: a `.git` dir/file in `cwd` or a parent. No `git`
+/// subprocess — home folders like `C:\Users\Administrator` must not block the
+/// UI thread on `git rev-parse`.
+pub fn has_git_ancestor(cwd: &Path) -> bool {
+    cwd.ancestors()
+        .take(8)
+        .any(|dir| dir.join(".git").exists())
 }
 
 /// Raise the OS timer resolution so the event loop's timed waits (`recv_timeout`,

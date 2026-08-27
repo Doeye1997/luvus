@@ -321,6 +321,112 @@ pub(super) fn descendant_commands(roots: &[u32]) -> Option<HashMap<u32, Vec<Stri
     )
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ProcessBasicInformationBuf {
+    reserved1: *mut core::ffi::c_void,
+    peb_base_address: *mut core::ffi::c_void,
+    reserved2: [*mut core::ffi::c_void; 2],
+    unique_process_id: usize,
+    reserved3: *mut core::ffi::c_void,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UnicodeString {
+    length: u16,
+    maximum_length: u16,
+    buffer: *mut u16,
+}
+
+fn read_process_memory<T: Copy>(process: HANDLE, addr: *const core::ffi::c_void) -> Option<T> {
+    let mut out = std::mem::MaybeUninit::<T>::uninit();
+    let mut read = 0_usize;
+    // SAFETY: `out` is writable for `size_of::<T>()` and `addr` is a pointer
+    // in the target process; failure is reported by the BOOL return.
+    let ok = unsafe {
+        ReadProcessMemory(
+            process,
+            addr,
+            out.as_mut_ptr().cast(),
+            size_of::<T>(),
+            &mut read,
+        )
+    };
+    (ok != 0 && read == size_of::<T>()).then(|| unsafe { out.assume_init() })
+}
+
+/// Another process's current directory via its PEB. Used so a workspace can
+/// follow a pane whose agent `chdir`'d in a child (Pi on Windows).
+#[cfg(target_pointer_width = "64")]
+pub(super) fn process_cwd(pid: u32) -> Option<std::path::PathBuf> {
+    const PEB_PROCESS_PARAMETERS: usize = 0x20;
+    const RTL_CURRENT_DIRECTORY: usize = 0x38;
+    let handle = OwnedHandle::new(unsafe {
+        OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid)
+    })?;
+    let mut info = ProcessBasicInformationBuf {
+        reserved1: std::ptr::null_mut(),
+        peb_base_address: std::ptr::null_mut(),
+        reserved2: [std::ptr::null_mut(), std::ptr::null_mut()],
+        unique_process_id: 0,
+        reserved3: std::ptr::null_mut(),
+    };
+    let mut returned = 0_u32;
+    // SAFETY: `info` is the ProcessBasicInformation buffer ntdll expects.
+    let status = unsafe {
+        NtQueryInformationProcess(
+            handle.0,
+            ProcessBasicInformation,
+            (&raw mut info).cast(),
+            size_of::<ProcessBasicInformationBuf>() as u32,
+            &mut returned,
+        )
+    };
+    if status != 0 || info.peb_base_address.is_null() {
+        return None;
+    }
+    let params: *mut core::ffi::c_void = read_process_memory(
+        handle.0,
+        (info.peb_base_address as usize + PEB_PROCESS_PARAMETERS) as *const _,
+    )?;
+    if params.is_null() {
+        return None;
+    }
+    let dos: UnicodeString =
+        read_process_memory(handle.0, (params as usize + RTL_CURRENT_DIRECTORY) as *const _)?;
+    if dos.buffer.is_null() || dos.length < 2 {
+        return None;
+    }
+    let wchar_len = (dos.length as usize) / 2;
+    if wchar_len == 0 || wchar_len > 4096 {
+        return None;
+    }
+    let mut buf = vec![0_u16; wchar_len];
+    let mut read = 0_usize;
+    let ok = unsafe {
+        ReadProcessMemory(
+            handle.0,
+            dos.buffer.cast(),
+            buf.as_mut_ptr().cast(),
+            dos.length as usize,
+            &mut read,
+        )
+    };
+    if ok == 0 || read < 2 {
+        return None;
+    }
+    let n = (read / 2).min(wchar_len);
+    let path = String::from_utf16_lossy(&buf[..n]);
+    let path = path.trim_end_matches(['\\', '\0']);
+    (!path.is_empty()).then(|| std::path::PathBuf::from(path))
+}
+
+#[cfg(not(target_pointer_width = "64"))]
+pub(super) fn process_cwd(_pid: u32) -> Option<std::path::PathBuf> {
+    None
+}
+
 pub(super) fn process_tree(root: u32) -> Vec<super::ProcInfo> {
     ProcessSnapshot::capture()
         .map(|mut snapshot| {
@@ -390,5 +496,21 @@ mod tests {
         assert!(command.to_ascii_lowercase().contains("/c"), "{command:?}");
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[test]
+    fn process_cwd_matches_this_process() {
+        let pid = std::process::id();
+        let cwd = process_cwd(pid).expect("Windows process cwd");
+        let expected = std::env::current_dir().expect("current_dir");
+        assert!(
+            crate::platform::same_path(&cwd, &expected),
+            "process_cwd={cwd:?} current_dir={expected:?}"
+        );
+        let tree = crate::platform::process_tree_cwd(pid).expect("tree cwd");
+        assert!(
+            crate::platform::same_path(&tree, &expected),
+            "process_tree_cwd={tree:?} current_dir={expected:?}"
+        );
     }
 }

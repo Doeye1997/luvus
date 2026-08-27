@@ -4618,7 +4618,7 @@ impl App {
             .filter_map(|(id, p)| {
                 let pid = p.child_pid.load(std::sync::atomic::Ordering::SeqCst);
                 (pid != 0)
-                    .then(|| crate::platform::process_cwd(pid))
+                    .then(|| crate::platform::process_tree_cwd(pid))
                     .flatten()
                     .map(|c| (*id, c))
             })
@@ -4639,6 +4639,95 @@ impl App {
                 ws.branch = branch;
             }
         }
+        self.rehome_panes_by_cwd();
+    }
+
+    /// Put a pane's tab under the open workspace whose folder actually contains
+    /// that pane's live cwd. Workspace roots stay static; only the tab strip
+    /// grouping moves. `cd /tmp` does not move anything (no matching workspace).
+    fn rehome_panes_by_cwd(&mut self) {
+        let homes: Vec<(PathBuf, usize)> = self
+            .workspaces
+            .iter()
+            .enumerate()
+            .map(|(i, ws)| (ws.cwd.clone(), i))
+            .collect();
+        let mut jobs = Vec::new();
+        for (id, pane) in &self.panes {
+            let Some(dest) = workspace_index_for_cwd(&homes, &pane.cwd) else {
+                continue;
+            };
+            let Some((src, _, pane_tab)) = self.pane_tab_home(*id) else {
+                continue;
+            };
+            if src == dest || !pane_tab {
+                continue;
+            }
+            jobs.push((*id, dest));
+        }
+        for (id, dest) in jobs {
+            self.move_pane_across_workspaces(id, dest);
+        }
+    }
+
+    fn pane_tab_home(&self, pane: PaneId) -> Option<(usize, usize, bool)> {
+        for (wi, ws) in self.workspaces.iter().enumerate() {
+            for (ti, tab) in ws.tabs.iter().enumerate() {
+                if tab.layout.leaves().contains(&pane) {
+                    return Some((wi, ti, tab.is_renameable()));
+                }
+            }
+        }
+        None
+    }
+
+    /// Reparent `pane` into a new tab of `dest` without killing the process.
+    /// Focus follows only when this pane is the focused one.
+    fn move_pane_across_workspaces(&mut self, pane: PaneId, dest: usize) {
+        if dest >= self.workspaces.len() {
+            return;
+        }
+        let Some((src, ti, _)) = self.pane_tab_home(pane) else {
+            return;
+        };
+        if src == dest {
+            return;
+        }
+        let focused = self.layout().focus == pane;
+        let emptied = self.workspaces[src].tabs[ti].layout.remove(pane);
+        if emptied {
+            self.workspaces[src].tabs.remove(ti);
+            if self.workspaces[src].active_tab >= self.workspaces[src].tabs.len()
+                && !self.workspaces[src].tabs.is_empty()
+            {
+                self.workspaces[src].active_tab = self.workspaces[src].tabs.len() - 1;
+            }
+        }
+        self.workspaces[dest]
+            .tabs
+            .push(Tab::panes(TileLayout::new(pane)));
+        let new_tab = self.workspaces[dest].tabs.len() - 1;
+        if self.workspaces[src].tabs.is_empty() && self.workspaces.len() > 1 {
+            let closed = src;
+            self.workspaces.remove(closed);
+            let dest = if dest > closed { dest - 1 } else { dest };
+            if focused {
+                self.active_ws = dest;
+                self.workspaces[dest].active_tab = self.workspaces[dest].tabs.len() - 1;
+                self.workspaces[dest].tabs.last_mut().unwrap().layout.focus = pane;
+            } else if self.active_ws == closed {
+                self.active_ws = dest.min(self.workspaces.len() - 1);
+            } else if self.active_ws > closed {
+                self.active_ws -= 1;
+            }
+        } else if focused {
+            self.active_ws = dest;
+            self.workspaces[dest].active_tab = new_tab;
+            self.workspaces[dest].tabs[new_tab].layout.focus = pane;
+        }
+        self.zoomed = false;
+        self.scroll_pane = None;
+        self.session_dirty = true;
     }
 
     /// Rescan the agents' on-disk session stores for sessions you can reopen,
@@ -5368,6 +5457,19 @@ impl App {
             ],
         );
     }
+}
+
+fn workspace_index_for_cwd(homes: &[(PathBuf, usize)], cwd: &std::path::Path) -> Option<usize> {
+    let mut best: Option<(usize, usize)> = None;
+    for (root, index) in homes {
+        if crate::platform::is_subpath(cwd, root) {
+            let len = root.as_os_str().len();
+            if best.is_none_or(|(best_len, _)| len > best_len) {
+                best = Some((len, *index));
+            }
+        }
+    }
+    best.map(|(_, index)| index)
 }
 
 fn ws_name(cwd: &std::path::Path) -> String {
@@ -11002,6 +11104,46 @@ mod cwd_test {
             app.ws().name,
             workspace_name,
             "cd does not rename the static workspace"
+        );
+    }
+
+    #[test]
+    fn is_subpath_treats_nested_folders_as_inside() {
+        let parent = std::path::Path::new(r"F:\Project\claude\skills");
+        assert!(crate::platform::is_subpath(parent, parent));
+        assert!(crate::platform::is_subpath(
+            std::path::Path::new(r"F:\Project\claude\skills\handoff"),
+            parent
+        ));
+        assert!(!crate::platform::is_subpath(
+            std::path::Path::new(r"F:\Project\claude\json提示词编辑器"),
+            parent
+        ));
+    }
+
+    #[test]
+    fn tab_moves_to_the_workspace_that_owns_the_pane_cwd() {
+        let _env = crate::persist::test_env("rehome-tab-cwd");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let home = app.ws().cwd.clone();
+        let other = std::env::temp_dir();
+        if crate::platform::same_path(&home, &other) {
+            return;
+        }
+        assert!(
+            app.create_workspace_at(other.clone()),
+            "second workspace opens"
+        );
+        let pane = app.layout().focus;
+        let (src, _, _) = app.pane_tab_home(pane).expect("pane has a tab");
+        assert_eq!(app.workspaces[src].cwd, other, "spawned in the new workspace");
+        app.panes.get_mut(&pane).unwrap().cwd = home.clone();
+        app.rehome_panes_by_cwd();
+        let (dest, _, _) = app.pane_tab_home(pane).expect("pane still has a tab");
+        assert!(
+            crate::platform::same_path(&app.workspaces[dest].cwd, &home),
+            "tab grouped under the workspace that owns the pane cwd"
         );
     }
 }
