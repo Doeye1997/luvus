@@ -24,13 +24,19 @@ pub fn same_path(a: &Path, b: &Path) -> bool {
     path_key(a) == path_key(b)
 }
 
-/// Cheap filesystem probe: a `.git` dir/file in `cwd` or a parent. No `git`
+/// Nearest `.git` dir/file in `cwd` or a parent, capped at 8 ancestors. No `git`
 /// subprocess — home folders like `C:\\Users\\Administrator` must not block the
 /// UI thread on `git rev-parse`.
-pub fn has_git_ancestor(cwd: &Path) -> bool {
+pub fn git_root(cwd: &Path) -> Option<PathBuf> {
     cwd.ancestors()
         .take(8)
-        .any(|dir| dir.join(".git").exists())
+        .find(|dir| dir.join(".git").exists())
+        .map(|dir| dir.to_path_buf())
+}
+
+/// Cheap filesystem probe: a `.git` dir/file in `cwd` or a parent.
+pub fn has_git_ancestor(cwd: &Path) -> bool {
+    git_root(cwd).is_some()
 }
 
 /// True when `child` is `parent` or a folder inside it (docs/43 WIN-6 spelling).

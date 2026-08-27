@@ -4644,29 +4644,82 @@ impl App {
 
     /// Put a pane's tab under the open workspace whose folder actually contains
     /// that pane's live cwd. Workspace roots stay static; only the tab strip
-    /// grouping moves. `cd /tmp` does not move anything (no matching workspace).
+    /// grouping moves. A git project with no open workspace gets one (no extra
+    /// shell) so an agent that `chdir`'d into `json-storyboard` is not stuck in
+    /// the spawn workspace. `cd /tmp` still does nothing (no git root).
     fn rehome_panes_by_cwd(&mut self) {
-        let homes: Vec<(PathBuf, usize)> = self
-            .workspaces
+        self.open_missing_git_workspaces();
+        let mut jobs: Vec<(PaneId, PathBuf)> = Vec::new();
+        {
+            let homes = self.workspace_homes();
+            for (id, pane) in &self.panes {
+                let Some(dest) = workspace_index_for_cwd(&homes, &pane.cwd) else {
+                    continue;
+                };
+                let Some((src, _, pane_tab)) = self.pane_tab_home(*id) else {
+                    continue;
+                };
+                if src == dest || !pane_tab {
+                    continue;
+                }
+                jobs.push((*id, self.workspaces[dest].cwd.clone()));
+            }
+        }
+        for (id, dest_cwd) in jobs {
+            let homes = self.workspace_homes();
+            let Some(dest) = workspace_index_for_cwd(&homes, &dest_cwd) else {
+                continue;
+            };
+            self.move_pane_across_workspaces(id, dest);
+        }
+    }
+
+    fn workspace_homes(&self) -> Vec<(PathBuf, usize)> {
+        self.workspaces
             .iter()
             .enumerate()
             .map(|(i, ws)| (ws.cwd.clone(), i))
-            .collect();
-        let mut jobs = Vec::new();
-        for (id, pane) in &self.panes {
-            let Some(dest) = workspace_index_for_cwd(&homes, &pane.cwd) else {
-                continue;
-            };
-            let Some((src, _, pane_tab)) = self.pane_tab_home(*id) else {
-                continue;
-            };
-            if src == dest || !pane_tab {
-                continue;
+            .collect()
+    }
+
+    /// Open a workspace at each pane-tab git root that no open workspace contains.
+    /// Does not spawn a shell — [`Self::move_pane_across_workspaces`] fills the tab.
+    fn open_missing_git_workspaces(&mut self) {
+        let mut roots: Vec<PathBuf> = Vec::new();
+        {
+            let homes = self.workspace_homes();
+            for (id, pane) in &self.panes {
+                let Some((_, _, pane_tab)) = self.pane_tab_home(*id) else {
+                    continue;
+                };
+                if !pane_tab || workspace_index_for_cwd(&homes, &pane.cwd).is_some() {
+                    continue;
+                }
+                let Some(root) = crate::platform::git_root(&pane.cwd) else {
+                    continue;
+                };
+                if roots.iter().any(|cwd| crate::platform::same_path(cwd, &root)) {
+                    continue;
+                }
+                roots.push(root);
             }
-            jobs.push((*id, dest));
         }
-        for (id, dest) in jobs {
-            self.move_pane_across_workspaces(id, dest);
+        for root in roots {
+            let name = ws_name(&root);
+            let branch = git_branch(&root);
+            let worktree = worktree_membership(&root);
+            self.workspaces.push(Workspace {
+                id: crate::ids::public_id("workspace"),
+                name,
+                cwd: root,
+                branch,
+                git_ahead_behind: None,
+                pinned: false,
+                worktree,
+                tabs: vec![],
+                active_tab: 0,
+            });
+            self.session_dirty = true;
         }
     }
 
@@ -11145,6 +11198,34 @@ mod cwd_test {
             crate::platform::same_path(&app.workspaces[dest].cwd, &home),
             "tab grouped under the workspace that owns the pane cwd"
         );
+    }
+
+    #[test]
+    fn unmatched_git_cwd_opens_a_workspace_and_moves_the_tab() {
+        let _env = crate::persist::test_env("rehome-open-git");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        let spawn = app.ws().cwd.clone();
+        let repo = std::env::temp_dir().join(format!(
+            "luvus-rehome-git-{}-{}",
+            std::process::id(),
+            pane.0
+        ));
+        if crate::platform::same_path(&spawn, &repo)
+            || crate::platform::is_subpath(&repo, &spawn)
+        {
+            return;
+        }
+        std::fs::create_dir_all(repo.join(".git")).expect("fake git root");
+        app.panes.get_mut(&pane).unwrap().cwd = repo.clone();
+        app.rehome_panes_by_cwd();
+        let (dest, _, _) = app.pane_tab_home(pane).expect("pane still has a tab");
+        assert!(
+            crate::platform::same_path(&app.workspaces[dest].cwd, &repo),
+            "unmatched git cwd opened as its own workspace"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
     }
 }
 
