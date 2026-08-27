@@ -4884,6 +4884,7 @@ impl App {
         };
         let panes_in_tab = tab.layout.leaves();
         let dest_id = self.workspaces[dest].id.clone();
+        let active_id = self.workspaces.get(self.active_ws).map(|ws| ws.id.clone());
         self.workspaces[dest].tabs.push(tab);
         let new_tab = self.workspaces[dest].tabs.len() - 1;
         if self.workspaces[src].tabs.is_empty() && self.workspaces.len() > 1 {
@@ -4899,6 +4900,10 @@ impl App {
             self.workspaces[dest].active_tab = new_tab;
             self.workspaces[dest].tabs[new_tab].layout.focus = focused_pane;
             self.zoomed = false;
+        } else if let Some(active_id) = active_id {
+            if let Some(index) = self.workspaces.iter().position(|ws| ws.id == active_id) {
+                self.active_ws = index;
+            }
         }
         if self
             .scroll_pane
@@ -11558,6 +11563,49 @@ mod cwd_test {
             &other
         ));
         let _ = std::fs::remove_dir_all(&other);
+    }
+
+    #[test]
+    fn unfocused_last_tab_rehome_keeps_the_viewing_workspace() {
+        let _env = crate::persist::test_env("rehome-keep-view");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let home = app.ws().cwd.clone();
+        let pane_a = app.layout().focus;
+        let mid = std::env::temp_dir().join(format!(
+            "luvus-rehome-view-b-{}-{}",
+            std::process::id(),
+            pane_a.0
+        ));
+        let dest = std::env::temp_dir().join(format!(
+            "luvus-rehome-view-c-{}-{}",
+            std::process::id(),
+            pane_a.0
+        ));
+        if crate::platform::same_path(&home, &mid)
+            || crate::platform::same_path(&home, &dest)
+            || crate::platform::is_subpath(&mid, &home)
+            || crate::platform::is_subpath(&dest, &home)
+        {
+            return;
+        }
+        std::fs::create_dir_all(mid.join(".git")).expect("B git root");
+        std::fs::create_dir_all(dest.join(".git")).expect("C git root");
+        assert!(app.create_workspace_at(mid.clone()), "workspace B");
+        assert!(app.create_workspace_at(dest.clone()), "workspace C");
+        assert_eq!(app.workspaces.len(), 3);
+        app.active_ws = 1;
+        app.panes.get_mut(&pane_a).unwrap().cwd = dest.clone();
+        app.rehome_panes_by_cwd();
+        assert!(
+            crate::platform::same_path(&app.ws().cwd, &mid),
+            "viewing B must survive A closing; got {:?}",
+            app.ws().cwd
+        );
+        let (wi, _, _) = app.pane_tab_home(pane_a).expect("pane still has a tab");
+        assert!(crate::platform::same_path(&app.workspaces[wi].cwd, &dest));
+        let _ = std::fs::remove_dir_all(&mid);
+        let _ = std::fs::remove_dir_all(&dest);
     }
 
     #[test]
