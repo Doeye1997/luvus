@@ -5507,13 +5507,23 @@ impl App {
 }
 
 fn workspace_index_for_cwd(homes: &[(PathBuf, usize)], cwd: &std::path::Path) -> Option<usize> {
+    let git_root = crate::platform::git_root(cwd);
     let mut best: Option<(usize, usize)> = None;
     for (root, index) in homes {
-        if crate::platform::is_subpath(cwd, root) {
-            let len = root.as_os_str().len();
-            if best.is_none_or(|(best_len, _)| len > best_len) {
-                best = Some((len, *index));
-            }
+        if !crate::platform::is_subpath(cwd, root) {
+            continue;
+        }
+        // Nested worktree/submodule has its own git root. A parent checkout
+        // that only contains that folder on disk is not this pane's home.
+        if git_root
+            .as_ref()
+            .is_some_and(|git_root| !crate::platform::is_subpath(root, git_root))
+        {
+            continue;
+        }
+        let len = root.as_os_str().len();
+        if best.is_none_or(|(best_len, _)| len > best_len) {
+            best = Some((len, *index));
         }
     }
     best.map(|(_, index)| index)
@@ -11217,6 +11227,47 @@ mod cwd_test {
             "unmatched git cwd opened as its own workspace"
         );
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn nested_worktree_cwd_opens_its_own_workspace() {
+        let _env = crate::persist::test_env("rehome-nested-wt");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        let spawn = app.ws().cwd.clone();
+        let parent = std::env::temp_dir().join(format!(
+            "luvus-rehome-wt-parent-{}-{}",
+            std::process::id(),
+            pane.0
+        ));
+        let wt = parent.join(".worktrees").join("feat");
+        if crate::platform::same_path(&spawn, &parent)
+            || crate::platform::is_subpath(&parent, &spawn)
+        {
+            return;
+        }
+        std::fs::create_dir_all(parent.join(".git")).expect("parent git root");
+        std::fs::create_dir_all(wt.join(".git")).expect("worktree git root");
+        app.workspaces.push(Workspace {
+            id: crate::ids::public_id("workspace"),
+            name: "parent".into(),
+            cwd: parent.clone(),
+            branch: None,
+            git_ahead_behind: None,
+            pinned: false,
+            worktree: None,
+            tabs: vec![],
+            active_tab: 0,
+        });
+        app.panes.get_mut(&pane).unwrap().cwd = wt.clone();
+        app.rehome_panes_by_cwd();
+        let (dest, _, _) = app.pane_tab_home(pane).expect("pane still has a tab");
+        assert!(
+            crate::platform::same_path(&app.workspaces[dest].cwd, &wt),
+            "nested worktree opened as its own workspace, not swallowed by parent"
+        );
+        let _ = std::fs::remove_dir_all(&parent);
     }
 }
 
