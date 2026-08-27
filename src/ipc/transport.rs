@@ -151,16 +151,8 @@ impl Conn {
         match self.0.set_send_timeout(Some(timeout)) {
             Ok(()) => Ok(TimeoutMode::Kernel),
             Err(error) if error.kind() == io::ErrorKind::Unsupported => {
-                #[cfg(windows)]
-                {
-                    let _ = timeout;
-                    Ok(TimeoutMode::Nonblocking)
-                }
-                #[cfg(not(windows))]
-                {
-                    self.0.set_nonblocking(true)?;
-                    Ok(TimeoutMode::Nonblocking)
-                }
+                self.0.set_nonblocking(true)?;
+                Ok(TimeoutMode::Nonblocking)
             }
             Err(error) => Err(error),
         }

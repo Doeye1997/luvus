@@ -683,35 +683,6 @@ fn resolve_pane_sessions(app: &App) -> HashMap<PaneId, Option<(String, String)>>
         }
     }
 
-    // Pass 1b: a live argv `--session` / `--session-id` names this pane the
-    // same way a hook does. Needed when several PI panes share a cwd, so Pass 2
-    // would refuse to guess.
-    for id in &ids {
-        if out.contains_key(id) {
-            continue;
-        }
-        let Some(st) = app.status.get(id) else {
-            continue;
-        };
-        let Some(sid) =
-            session_id_in_commands(app.proc_commands.get(id).map(Vec::as_slice).unwrap_or(&[]))
-        else {
-            continue;
-        };
-        let agent = snapshot_agent(
-            &app.manifests,
-            app.proc_commands.get(id).map(Vec::as_slice),
-            &st.agent,
-        );
-        if !crate::agent::is_resumable(&agent) {
-            continue;
-        }
-        let key = (agent, sid);
-        if claimed.insert(key.clone()) {
-            out.insert(*id, Some(key));
-        }
-    }
-
     // Pass 2: group unbound panes before looking at native session stores. A
     // `(agent, cwd)` identifies a set of possible conversations, not a pane.
     // Only a one-pane / one-session group can be recovered safely.
@@ -769,45 +740,6 @@ fn resolve_pane_sessions(app: &App) -> HashMap<PaneId, Option<(String, String)>>
 /// is the safer identity during the small interval before the UI catches up.
 /// If process information is unavailable, preserve the existing status-based
 /// behaviour.
-fn session_id_in_commands(commands: &[String]) -> Option<String> {
-    for command in commands {
-        if let Some(value) =
-            flag_value(command, "--session").or_else(|| flag_value(command, "--session-id"))
-        {
-            if session_id_token_ok(&value) {
-                return Some(value);
-            }
-        }
-    }
-    None
-}
-
-fn flag_value(command: &str, flag: &str) -> Option<String> {
-    let eq = format!("{flag}=");
-    if let Some(rest) = command.split_once(&eq).map(|(_, rest)| rest) {
-        return rest
-            .split_whitespace()
-            .next()
-            .map(|s| s.trim_matches('"').to_string())
-            .filter(|s| !s.is_empty());
-    }
-    let spaced = format!("{flag} ");
-    command.split_once(&spaced).and_then(|(_, rest)| {
-        rest.split_whitespace()
-            .next()
-            .map(|s| s.trim_matches('"').to_string())
-            .filter(|s| !s.is_empty())
-    })
-}
-
-fn session_id_token_ok(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 256
-        && id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '/'))
-}
-
 fn snapshot_agent(
     manifests: &crate::detect::Manifests,
     commands: Option<&[String]>,
@@ -1117,27 +1049,6 @@ mod diff_snap_schema_tests {
         assert!(!restored.wrap);
         assert_eq!(restored.context_lines, 3);
         assert!(restored.show_line_numbers);
-    }
-}
-
-#[cfg(test)]
-mod session_flag_tests {
-    use super::*;
-
-    #[test]
-    fn session_id_in_commands_reads_pi_session_flag() {
-        assert_eq!(session_id_in_commands(&["pwsh.exe".into()]), None);
-        assert_eq!(
-            session_id_in_commands(&[
-                "node.exe pi-coding-agent --session 01a03ef7-b621-7433-bc7b-55c3a69d5408".into(),
-            ])
-            .as_deref(),
-            Some("01a03ef7-b621-7433-bc7b-55c3a69d5408")
-        );
-        assert_eq!(
-            session_id_in_commands(&["pi --session=abc-1".into()]).as_deref(),
-            Some("abc-1")
-        );
     }
 }
 
