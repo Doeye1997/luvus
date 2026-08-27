@@ -4883,25 +4883,28 @@ impl App {
             tab
         };
         let panes_in_tab = tab.layout.leaves();
+        let dest_id = self.workspaces[dest].id.clone();
         self.workspaces[dest].tabs.push(tab);
-        let mut dest = dest;
         let new_tab = self.workspaces[dest].tabs.len() - 1;
         if self.workspaces[src].tabs.is_empty() && self.workspaces.len() > 1 {
-            let closed = src;
-            self.workspaces.remove(closed);
-            if dest > closed {
-                dest -= 1;
-            }
-            if self.active_ws == closed {
-                self.active_ws = dest.min(self.workspaces.len() - 1);
-            } else if self.active_ws > closed {
-                self.active_ws -= 1;
-            }
+            self.close_workspace(src);
         }
+        let dest = self
+            .workspaces
+            .iter()
+            .position(|ws| ws.id == dest_id)
+            .unwrap_or(0);
         if focused {
             self.active_ws = dest;
             self.workspaces[dest].active_tab = new_tab;
             self.workspaces[dest].tabs[new_tab].layout.focus = focused_pane;
+            self.zoomed = false;
+        }
+        if self
+            .scroll_pane
+            .is_some_and(|id| panes_in_tab.contains(&id))
+        {
+            self.scroll_pane = None;
         }
         for pane in &panes_in_tab {
             self.emit_event(
@@ -4913,8 +4916,6 @@ impl App {
                 }),
             );
         }
-        self.zoomed = false;
-        self.scroll_pane = None;
         self.session_dirty = true;
         true
     }
@@ -11486,6 +11487,111 @@ mod cwd_test {
         assert_eq!(
             app.workspaces[src].active_tab, 1,
             "active tab stayed on the same tab object after the earlier removal"
+        );
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    #[test]
+    fn last_tab_rehome_closes_source_workspace_through_helper() {
+        let _env = crate::persist::test_env("rehome-close-helper");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let home = app.ws().cwd.clone();
+        let home_id = app.ws().id.clone();
+        let pane = app.layout().focus;
+        let other = std::env::temp_dir().join(format!(
+            "luvus-rehome-close-{}-{}",
+            std::process::id(),
+            pane.0
+        ));
+        if crate::platform::same_path(&home, &other) || crate::platform::is_subpath(&other, &home) {
+            return;
+        }
+        std::fs::create_dir_all(other.join(".git")).expect("dest git root");
+        let (files_reply, files_rx) = std::sync::mpsc::channel();
+        app.pending_file_tree_api.push((
+            home.clone(),
+            crate::ipc::api::ApiRequest {
+                id: "files".into(),
+                method: "files.tree".into(),
+                params: serde_json::Value::Null,
+                reply: files_reply,
+            },
+        ));
+        let (diff_reply, diff_rx) = std::sync::mpsc::channel();
+        app.pending_diff_api.push((
+            home.clone(),
+            crate::ipc::api::ApiRequest {
+                id: "diff".into(),
+                method: "diff.list".into(),
+                params: serde_json::Value::Null,
+                reply: diff_reply,
+            },
+        ));
+        app.ws_rename = Some(WsRename {
+            workspace_id: home_id.clone(),
+            buffer: "keep".into(),
+        });
+        app.worktree_delete = Some(home_id.clone());
+        assert!(app.create_workspace_at(other.clone()), "second workspace");
+        app.panes.get_mut(&pane).unwrap().cwd = other.clone();
+        app.rehome_panes_by_cwd();
+        assert!(
+            app.workspaces
+                .iter()
+                .all(|ws| !crate::platform::same_path(&ws.cwd, &home)),
+            "empty source workspace closed"
+        );
+        let files = files_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("FILES waiter failed when rehome closed the workspace");
+        assert!(files.contains("workspace closed"), "{files}");
+        let diff = diff_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("DIFF waiter failed when rehome closed the workspace");
+        assert!(diff.contains("workspace closed"), "{diff}");
+        assert!(app.ws_rename.is_none(), "rename modal disarmed");
+        assert!(app.worktree_delete.is_none(), "worktree-delete disarmed");
+        let (dest, _, _) = app.pane_tab_home(pane).expect("pane still has a tab");
+        assert!(crate::platform::same_path(
+            &app.workspaces[dest].cwd,
+            &other
+        ));
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    #[test]
+    fn background_rehome_preserves_zoom_and_scroll() {
+        let _env = crate::persist::test_env("rehome-zoom");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let home = app.ws().cwd.clone();
+        app.new_tab();
+        app.new_tab();
+        app.workspaces[0].active_tab = 2;
+        let focus = app.layout().focus;
+        let first = app.workspaces[0].tabs[0].layout.leaves()[0];
+        let other = std::env::temp_dir().join(format!(
+            "luvus-rehome-zoom-{}-{}",
+            std::process::id(),
+            first.0
+        ));
+        if crate::platform::same_path(&home, &other) || crate::platform::is_subpath(&other, &home) {
+            return;
+        }
+        std::fs::create_dir_all(other.join(".git")).expect("dest git root");
+        assert!(app.create_workspace_at(other.clone()), "second workspace");
+        app.active_ws = 0;
+        app.workspaces[0].active_tab = 2;
+        app.zoomed = true;
+        app.scroll_pane = Some(focus);
+        app.panes.get_mut(&first).unwrap().cwd = other.clone();
+        app.rehome_panes_by_cwd();
+        assert!(app.zoomed, "background rehome must not drop zoom");
+        assert_eq!(
+            app.scroll_pane,
+            Some(focus),
+            "scroll mode stays on the focused pane"
         );
         let _ = std::fs::remove_dir_all(&other);
     }
