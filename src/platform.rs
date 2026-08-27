@@ -341,19 +341,19 @@ pub fn is_stoppable_luvus_pid(pid: u32) -> bool {
         if !process_belongs_to_current_user(pid) {
             return false;
         }
-        return process_tree(pid).first().is_some_and(|info| {
+        process_tree(pid).first().is_some_and(|info| {
             let name = info
                 .command
                 .rsplit(['\\', '/'])
                 .next()
                 .unwrap_or(&info.command);
             name.eq_ignore_ascii_case("luvus.exe")
-        });
+        })
     }
     #[cfg(target_os = "linux")]
     {
-        return std::fs::read_to_string(format!("/proc/{pid}/comm"))
-            .is_ok_and(|comm| comm.trim() == "luvus");
+        std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .is_ok_and(|comm| comm.trim() == "luvus")
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {
@@ -366,7 +366,7 @@ pub fn is_stoppable_luvus_pid(pid: u32) -> bool {
             .next()
             .unwrap_or(&info.command);
         let base = name.rsplit('/').next().unwrap_or(name);
-        return base == "luvus";
+        base == "luvus"
     }
     #[cfg(not(any(windows, unix)))]
     {
