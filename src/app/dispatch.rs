@@ -2460,6 +2460,9 @@ impl App {
                         json!({"pane":id.0.to_string(), "status":state_str(state), "agent":agent, "cwd":cwd, "project":project, "branch":branch, "authority":"integration_report"}),
                     );
                 }
+                if session_id.is_some() {
+                    self.session_dirty = true;
+                }
                 self.check_agent_waits(id);
                 Ok(json!({
                     "type":"agent_report", "pane":id.0.to_string(),
@@ -6594,6 +6597,49 @@ command = ["true"]
         .unwrap();
         assert!(app.status[&pane].agent_report.is_none());
         assert!(app.status[&pane].force_detect);
+    }
+
+    #[test]
+    fn agent_report_with_session_dirties_snapshot() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        app.session_dirty = false;
+
+        app.dispatch(
+            "agent.report",
+            &json!({
+                "pane": pane.0.to_string(),
+                "source": "pi-lifecycle-extension",
+                "agent": "pi",
+                "status": "idle",
+                "session_id": "01a04120-95c0-71b3-8be9-1ea1d7e7be8d",
+            }),
+        )
+        .unwrap();
+
+        let sess = app.status.get(&pane).unwrap().agent_session.as_ref().unwrap();
+        assert_eq!(sess.agent, "pi");
+        assert_eq!(sess.session_id, "01a04120-95c0-71b3-8be9-1ea1d7e7be8d");
+        assert!(app.session_dirty, "a bound session must enter the 2s snapshot");
+
+        let json = serde_json::to_string(&crate::persist::snapshot(&app)).unwrap();
+        let snap: crate::persist::SessionSnapshot = serde_json::from_str(&json).unwrap();
+        let (tx2, _rx2) = std::sync::mpsc::channel();
+        let restored = App::from_snapshot(snap, tx2).expect("restore");
+        let rid = restored.layout().focus;
+        let restored_sess = restored
+            .status
+            .get(&rid)
+            .unwrap()
+            .agent_session
+            .as_ref()
+            .unwrap();
+        assert_eq!(restored_sess.agent, "pi");
+        assert_eq!(
+            restored_sess.session_id,
+            "01a04120-95c0-71b3-8be9-1ea1d7e7be8d"
+        );
     }
 
     #[test]
