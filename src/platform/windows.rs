@@ -322,6 +322,7 @@ pub(super) fn descendant_commands(roots: &[u32]) -> Option<HashMap<u32, Vec<Stri
 }
 
 #[repr(C)]
+#[cfg(target_arch = "x86_64")]
 struct UnicodeString {
     length: u16,
     _maximum_length: u16,
@@ -330,7 +331,8 @@ struct UnicodeString {
 
 /// Another process's current directory via its PEB. Used so a workspace can
 /// follow a pane whose agent `chdir`'d in a child (Pi on Windows).
-#[cfg(target_pointer_width = "64")]
+/// The DosPath offset is the x86_64 layout; other Windows archs use the stub.
+#[cfg(target_arch = "x86_64")]
 pub(super) fn process_cwd(pid: u32) -> Option<std::path::PathBuf> {
     let process = OwnedHandle::new(unsafe {
         OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid)
@@ -411,7 +413,8 @@ pub(super) fn descendant_pid_trees(
         .collect()
 }
 
-#[cfg(not(target_pointer_width = "64"))]
+/// Unsupported until the x86_64 PEB offset is independently verified (ARM64).
+#[cfg(not(target_arch = "x86_64"))]
 pub(super) fn process_cwd(_pid: u32) -> Option<std::path::PathBuf> {
     None
 }
