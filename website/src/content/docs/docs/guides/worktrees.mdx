@@ -22,3 +22,8 @@ can work the same repo without any chance of stepping on each other's edits.
 The sidebar **nests worktrees under their repo**, so the grouping is always
 visible. This is also the foundation the
 [orchestration board](/docs/guides/orchestration/) builds on.
+
+If a pane `cd`s into a nested worktree folder (for example
+`.worktrees/<name>`), luvus treats that worktree as its own workspace instead
+of leaving the tab under the parent checkout. See
+[Following a pane's working directory](/docs/guides/layout/#following-a-panes-working-directory).

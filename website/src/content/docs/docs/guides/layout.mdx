@@ -74,9 +74,10 @@ final position and preserves whichever tab was active.
 
 ## Workspaces
 
-A **workspace** is one project folder, fixed at its `cwd` (see
+A **workspace** is one project folder (see
 [Core Concepts](/docs/getting-started/concepts/#2-workspace--tab--pane)). They
-live in the sidebar's top list.
+live in the sidebar's top list. The folder on a workspace row does not change;
+tabs can move when their panes `cd` into another git project.
 
 - **Open one:** the `+` button above the list, or `Ctrl+Space N`, opens a
   **folder picker**. Browse with the arrows / wheel, use the **Home** row to jump
@@ -121,6 +122,36 @@ it from the desktop switcher with `Ctrl+Space M`, or open it through automation:
 luvus mission open
 luvus mission open 2
 ```
+
+### Following a pane's working directory
+
+This is the same on macOS, Linux, and Windows. About once a second, luvus
+reads each pane's process working directory. The workspace folder stays put;
+the **tab** is what moves.
+
+- **Git project, already open.** If every pane in a tab's layout is inside the
+  same other workspace, the whole tab moves there. Splits stay together.
+- **Git project, not open.** luvus opens a workspace at that git root (no extra
+  shell) and moves the tab. Nested worktrees with their own `.git` become
+  their own workspace instead of staying under the parent checkout.
+- **Mixed-cwd splits.** If only some panes in a split have `cd`'d into another
+  project, the tab stays. luvus will not tear a layout apart.
+- **Two-scan stability.** A *child* process that `chdir`s into a different git
+  repo must appear on two consecutive scans before it can change the pane cwd
+  or move the tab. A short-lived helper in another repo does not rehome
+  anything. The pane's own PTY child cwd is used as soon as it is seen.
+- **Source workspace closure.** If that was the last ordinary tab in the source
+  workspace, luvus closes the empty workspace (same helper as sidebar Close:
+  FILES/DIFF waiters fail and `workspace.closed` fires). Focus follows the
+  moved tab only when you were looking at it; an unfocused last-tab rehome
+  keeps the workspace you are viewing.
+- **Non-git paths.** `cd /tmp` (or any folder that is not a git project and not
+  inside an open workspace) does not create or move a workspace.
+
+Dashboard tabs (git, orchestration, and similar) never rehome. On Windows,
+PowerShell `Set-Location` may not update the process current directory luvus
+reads; `cd` in `cmd.exe` typically does. The shell integration hook is still
+Unix-only.
 
 ## The sidebar
 
