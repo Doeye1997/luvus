@@ -527,28 +527,46 @@ mod tests {
 
     #[test]
     fn process_tree_sees_child_cwd_change() {
-        let target = std::env::temp_dir().join(format!(
-            "luvus-win-child-cwd-{}-{}",
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let spawn_dir = std::env::temp_dir().join(format!(
+            "luvus-win-cwd-root-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
+            stamp
         ));
-        std::fs::create_dir_all(target.join(".git")).expect("child git cwd");
-        // Parent cmd starts in temp; the ping child is created in `target`.
-        // That is the pane-tree case: a descendant running in another git
-        // root. CREATE_NO_WINDOW: detached Luvus must not flash a console.
+        let target = std::env::temp_dir().join(format!(
+            "luvus-win-cwd-desc-{}-{}",
+            std::process::id(),
+            stamp
+        ));
+        std::fs::create_dir_all(&spawn_dir).expect("root cwd");
+        std::fs::create_dir_all(target.join(".git")).expect("descendant git cwd");
+        // Root stays in `spawn_dir` (no git). Ping is a descendant started in
+        // `target`, so owner_cwd cannot equal descendant_git_cwd.
+        // CREATE_NO_WINDOW: detached Luvus must not flash a console.
+        let ps = format!(
+            "Start-Process -FilePath ping.exe -ArgumentList '-n','20','127.0.0.1' -WorkingDirectory '{}' -Wait -WindowStyle Hidden",
+            target.display()
+        );
         let mut child = crate::platform::no_window(
-            std::process::Command::new("cmd.exe")
-                .args(["/C", "ping.exe -n 20 127.0.0.1"])
-                .current_dir(&target)
+            std::process::Command::new("powershell.exe")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-WindowStyle",
+                    "Hidden",
+                    "-Command",
+                    &ps,
+                ])
+                .current_dir(&spawn_dir)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null()),
         )
         .spawn()
-        .expect("spawn cmd child");
+        .expect("spawn powershell parent");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
         let mut seen = None;
         let mut last_status = None;
@@ -556,17 +574,16 @@ mod tests {
             last_status = child.try_wait().ok().flatten();
             let scan = crate::platform::scan_pane_cwds(&[child.id()]);
             if let Some(evidence) = scan.first() {
-                for cwd in [
-                    evidence.owner_cwd.as_ref(),
-                    evidence.descendant_git_cwd.as_ref(),
-                ]
-                .into_iter()
-                .flatten()
-                {
-                    if crate::platform::same_path(cwd, &target) {
-                        seen = Some(cwd.clone());
-                        break;
-                    }
+                let owner_ok = evidence
+                    .owner_cwd
+                    .as_ref()
+                    .is_some_and(|cwd| !crate::platform::same_path(cwd, &target));
+                let desc_ok = evidence
+                    .descendant_git_cwd
+                    .as_ref()
+                    .is_some_and(|cwd| crate::platform::same_path(cwd, &target));
+                if owner_ok && desc_ok {
+                    seen = Some(evidence.clone());
                 }
             }
             if seen.is_some() {
@@ -579,10 +596,25 @@ mod tests {
         }
         let _ = child.kill();
         let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&spawn_dir);
         let _ = std::fs::remove_dir_all(&target);
+        let evidence = seen
+            .unwrap_or_else(|| panic!("descendant git cwd not observed status={last_status:?}"));
         assert!(
-            seen.is_some(),
-            "process tree did not observe child cwd {target:?} status={last_status:?}"
+            evidence
+                .owner_cwd
+                .as_ref()
+                .is_some_and(|cwd| !crate::platform::same_path(cwd, &target)),
+            "owner_cwd must stay outside the target repo, got {:?}",
+            evidence.owner_cwd
+        );
+        assert!(
+            evidence
+                .descendant_git_cwd
+                .as_ref()
+                .is_some_and(|cwd| crate::platform::same_path(cwd, &target)),
+            "descendant_git_cwd must be the target repo, got {:?}",
+            evidence.descendant_git_cwd
         );
     }
 }
