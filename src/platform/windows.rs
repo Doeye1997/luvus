@@ -546,30 +546,29 @@ mod tests {
         ));
         std::fs::create_dir_all(&spawn_dir).expect("root cwd");
         std::fs::create_dir_all(target.join(".git")).expect("descendant git cwd");
-        // Root stays in `spawn_dir` (no git). Ping is a descendant started in
-        // `target`, so owner_cwd cannot equal descendant_git_cwd.
-        // CREATE_NO_WINDOW: detached Luvus must not flash a console.
-        let ps = format!(
-            "Start-Process -FilePath ping.exe -ArgumentList '-n','20','127.0.0.1' -WorkingDirectory '{}' -Wait -WindowStyle Hidden",
-            target.display()
-        );
+        // Root cmd stays in `spawn_dir` (no git). Nested cmd cds into
+        // `target` and holds ping there. CREATE_NO_WINDOW: no console flash.
+        // Script keeps `cd` out of CreateProcess quoting.
+        let script = spawn_dir.join("run-descendant.cmd");
+        std::fs::write(
+            &script,
+            format!(
+                "@echo off\r\ncd /d \"{}\"\r\nping.exe -n 20 127.0.0.1\r\n",
+                target.display()
+            ),
+        )
+        .expect("write descendant script");
         let mut child = crate::platform::no_window(
-            std::process::Command::new("powershell.exe")
-                .args([
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-WindowStyle",
-                    "Hidden",
-                    "-Command",
-                    &ps,
-                ])
+            std::process::Command::new("cmd.exe")
+                .args(["/C", "cmd.exe", "/C"])
+                .arg(&script)
                 .current_dir(&spawn_dir)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null()),
         )
         .spawn()
-        .expect("spawn powershell parent");
+        .expect("spawn cmd child");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
         let mut seen = None;
         let mut last_status = None;
