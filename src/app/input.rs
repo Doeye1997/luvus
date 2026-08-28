@@ -499,8 +499,8 @@ impl App {
             AppEvent::CwdScanned {
                 panes,
                 branches,
-                git_roots,
-            } => self.apply_cwd_scan(panes, branches, git_roots),
+                workspace_candidates,
+            } => self.apply_cwd_scan(panes, branches, workspace_candidates),
             // Mission Control usage (docs/54, MC-2): swap in the fresh cache; the
             // mission render blits it. Repaint so a visible mission tab updates.
             AppEvent::UsageScanned { usage, mtimes } => {
