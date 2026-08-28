@@ -3,7 +3,7 @@
 //! (docs/04). Prefix-key driven.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc::Sender, Arc};
 use std::time::{Duration, Instant};
 
@@ -4632,7 +4632,7 @@ impl App {
             .collect();
         let pids: Vec<u32> = panes.iter().map(|(_, pid)| *pid).collect();
         let evidence = crate::platform::scan_pane_cwds(&pids);
-        let pane_results = panes
+        let pane_results: Vec<(PaneId, crate::platform::PaneCwdEvidence)> = panes
             .into_iter()
             .zip(evidence)
             .map(|((id, _), ev)| (id, ev))
@@ -4642,24 +4642,31 @@ impl App {
             .iter()
             .map(|ws| (ws.id.clone(), git_branch(&ws.cwd)))
             .collect();
-        self.apply_cwd_scan(pane_results, branches);
+        let git_roots = git_root_infos_from_evidence(&pane_results);
+        self.apply_cwd_scan(pane_results, branches, git_roots);
     }
 
     /// Apply one off-loop cwd snapshot. The PTY child owns the pane cwd; a
     /// descendant git cwd overrides only after [`CWD_REHOME_STABLE_SCANS`].
+    /// Git root / branch / worktree membership come from the worker; this
+    /// path does not probe the filesystem.
     fn apply_cwd_scan(
         &mut self,
         panes: Vec<(PaneId, crate::platform::PaneCwdEvidence)>,
         branches: Vec<(String, Option<String>)>,
+        git_roots: Vec<crate::git::GitRootInfo>,
     ) -> bool {
         self.cwd_scan_inflight = false;
         let live: HashSet<PaneId> = panes.iter().map(|(id, _)| *id).collect();
         self.cwd_git_hits.retain(|id, _| live.contains(id));
         let mut changed = false;
+        let mut pane_git: HashMap<PaneId, Option<PathBuf>> = HashMap::new();
         for (id, evidence) in panes {
             let Some(chosen) = self.choose_pane_cwd(id, &evidence) else {
                 continue;
             };
+            let git_root = pane_git_root_for_cwd(&evidence, &chosen);
+            pane_git.insert(id, git_root);
             let Some(pane) = self.panes.get_mut(&id) else {
                 continue;
             };
@@ -4676,7 +4683,7 @@ impl App {
                 }
             }
         }
-        let moved = self.rehome_panes_by_cwd();
+        let moved = self.rehome_with_git(&pane_git, &git_roots);
         changed || moved
     }
 
@@ -4722,8 +4729,26 @@ impl App {
     /// that tab's live cwd. The tab is the unit of rehoming so a split layout
     /// stays together. Workspace roots stay static. A git project with no open
     /// workspace gets one (no extra shell). `cd /tmp` still does nothing.
+    ///
+    /// Test helper: probes git on this thread. The live path uses
+    /// [`Self::rehome_with_git`] with worker-resolved metadata.
+    #[cfg(test)]
     fn rehome_panes_by_cwd(&mut self) -> bool {
-        self.open_missing_git_workspaces();
+        let pane_git: HashMap<PaneId, Option<PathBuf>> = self
+            .panes
+            .iter()
+            .map(|(id, pane)| (*id, crate::platform::git_root(&pane.cwd)))
+            .collect();
+        let git_roots = git_root_infos_from_roots(pane_git.values().flatten());
+        self.rehome_with_git(&pane_git, &git_roots)
+    }
+
+    fn rehome_with_git(
+        &mut self,
+        pane_git: &HashMap<PaneId, Option<PathBuf>>,
+        git_roots: &[crate::git::GitRootInfo],
+    ) -> bool {
+        self.open_missing_git_workspaces(pane_git, git_roots);
         let mut jobs: Vec<(PaneId, PathBuf)> = Vec::new();
         let candidates: Vec<(usize, Vec<PaneId>)> = self
             .workspaces
@@ -4740,7 +4765,12 @@ impl App {
             let homes = self.workspace_homes();
             for (wi, leaves) in candidates {
                 let Some(dest) = tab_rehome_dest(&homes, wi, &leaves, |id| {
-                    self.panes.get(&id).map(|pane| pane.cwd.as_path())
+                    self.panes.get(&id).map(|pane| {
+                        (
+                            pane.cwd.as_path(),
+                            pane_git.get(&id).and_then(|root| root.as_deref()),
+                        )
+                    })
                 }) else {
                     continue;
                 };
@@ -4752,7 +4782,8 @@ impl App {
         let mut moved = false;
         for (leaf, dest_cwd) in jobs {
             let homes = self.workspace_homes();
-            let Some(dest) = workspace_index_for_cwd(&homes, &dest_cwd) else {
+            let git_root = pane_git.get(&leaf).and_then(|root| root.as_deref());
+            let Some(dest) = workspace_index_for_cwd(&homes, &dest_cwd, git_root) else {
                 continue;
             };
             moved |= self.move_tab_across_workspaces(leaf, dest);
@@ -4770,7 +4801,12 @@ impl App {
 
     /// Open a workspace at each tab git root that no open workspace contains.
     /// Split tabs open a workspace only when every leaf shares that root.
-    fn open_missing_git_workspaces(&mut self) {
+    /// `pane_git` / `git_roots` are worker-resolved; this does not probe disk.
+    fn open_missing_git_workspaces(
+        &mut self,
+        pane_git: &HashMap<PaneId, Option<PathBuf>>,
+        git_roots: &[crate::git::GitRootInfo],
+    ) {
         let mut roots: Vec<PathBuf> = Vec::new();
         {
             let homes = self.workspace_homes();
@@ -4787,17 +4823,18 @@ impl App {
                             conflict = true;
                             break;
                         };
-                        if workspace_index_for_cwd(&homes, &pane.cwd).is_some() {
+                        let git_root = pane_git.get(id).and_then(|root| root.as_deref());
+                        if workspace_index_for_cwd(&homes, &pane.cwd, git_root).is_some() {
                             conflict = true;
                             break;
                         }
-                        let Some(root) = crate::platform::git_root(&pane.cwd) else {
+                        let Some(root) = git_root else {
                             conflict = true;
                             break;
                         };
                         match &agreed {
-                            None => agreed = Some(root),
-                            Some(prev) if !crate::platform::same_path(prev, &root) => {
+                            None => agreed = Some(root.to_path_buf()),
+                            Some(prev) if !crate::platform::same_path(prev, root) => {
                                 conflict = true;
                                 break;
                             }
@@ -4821,17 +4858,21 @@ impl App {
             }
         }
         for root in roots {
+            let info = git_roots
+                .iter()
+                .find(|info| crate::platform::same_path(&info.root, &root));
+            let Some(info) = info else {
+                continue;
+            };
             let name = ws_name(&root);
-            let branch = git_branch(&root);
-            let worktree = worktree_membership(&root);
             self.workspaces.push(Workspace {
                 id: crate::ids::public_id("workspace"),
                 name,
                 cwd: root,
-                branch,
+                branch: info.branch.clone(),
                 git_ahead_behind: None,
                 pinned: false,
-                worktree,
+                worktree: info.worktree.clone(),
                 tabs: vec![],
                 active_tab: 0,
             });
@@ -5658,13 +5699,13 @@ fn tab_rehome_dest<'a>(
     homes: &[(PathBuf, usize)],
     src: usize,
     leaves: &[PaneId],
-    cwd_of: impl Fn(PaneId) -> Option<&'a std::path::Path>,
+    cwd_of: impl Fn(PaneId) -> Option<(&'a std::path::Path, Option<&'a std::path::Path>)>,
 ) -> Option<usize> {
     let dests: Vec<Option<usize>> = leaves
         .iter()
         .map(|id| {
             cwd_of(*id)
-                .and_then(|cwd| workspace_index_for_cwd(homes, cwd))
+                .and_then(|(cwd, git_root)| workspace_index_for_cwd(homes, cwd, git_root))
                 .filter(|index| *index != src)
         })
         .collect();
@@ -5676,8 +5717,11 @@ fn tab_rehome_dest<'a>(
     }
 }
 
-fn workspace_index_for_cwd(homes: &[(PathBuf, usize)], cwd: &std::path::Path) -> Option<usize> {
-    let git_root = crate::platform::git_root(cwd);
+fn workspace_index_for_cwd(
+    homes: &[(PathBuf, usize)],
+    cwd: &std::path::Path,
+    git_root: Option<&std::path::Path>,
+) -> Option<usize> {
     let mut best: Option<(usize, usize)> = None;
     for (root, index) in homes {
         if !crate::platform::is_subpath(cwd, root) {
@@ -5685,10 +5729,7 @@ fn workspace_index_for_cwd(homes: &[(PathBuf, usize)], cwd: &std::path::Path) ->
         }
         // Nested worktree/submodule has its own git root. A parent checkout
         // that only contains that folder on disk is not this pane's home.
-        if git_root
-            .as_ref()
-            .is_some_and(|git_root| !crate::platform::is_subpath(root, git_root))
-        {
+        if git_root.is_some_and(|git_root| !crate::platform::is_subpath(root, git_root)) {
             continue;
         }
         let len = root.as_os_str().len();
@@ -5751,9 +5792,57 @@ fn worktrees_dir_for(repo: &std::path::Path) -> PathBuf {
     persist::config_dir().join("worktrees").join(repo_name)
 }
 
+fn pane_git_root_for_cwd(
+    evidence: &crate::platform::PaneCwdEvidence,
+    cwd: &Path,
+) -> Option<PathBuf> {
+    if evidence
+        .descendant_git_cwd
+        .as_ref()
+        .is_some_and(|desc| crate::platform::same_path(desc, cwd))
+    {
+        evidence.descendant_git_root.clone()
+    } else {
+        evidence.owner_git_root.clone()
+    }
+}
+
+#[cfg(test)]
+fn git_root_infos_from_evidence(
+    panes: &[(PaneId, crate::platform::PaneCwdEvidence)],
+) -> Vec<crate::git::GitRootInfo> {
+    git_root_infos_from_roots(panes.iter().flat_map(|(_, evidence)| {
+        evidence
+            .owner_git_root
+            .iter()
+            .chain(evidence.descendant_git_root.iter())
+    }))
+}
+
+#[cfg(test)]
+fn git_root_infos_from_roots<'a>(
+    roots: impl Iterator<Item = &'a PathBuf>,
+) -> Vec<crate::git::GitRootInfo> {
+    let mut infos = Vec::new();
+    for root in roots {
+        if infos
+            .iter()
+            .any(|info: &crate::git::GitRootInfo| crate::platform::same_path(&info.root, root))
+        {
+            continue;
+        }
+        infos.push(crate::git::GitRootInfo {
+            root: root.clone(),
+            branch: git_branch(root),
+            worktree: worktree_membership(root),
+        });
+    }
+    infos
+}
+
 /// Worktree grouping for a workspace at `cwd` (docs/18 WT): its git common dir, if
 /// `cwd` is inside a repo. Workspaces that share one group together in the sidebar.
-fn worktree_membership(cwd: &std::path::Path) -> Option<crate::git::WorktreeMembership> {
+pub(crate) fn worktree_membership(cwd: &std::path::Path) -> Option<crate::git::WorktreeMembership> {
     crate::git::local::common_dir(cwd).map(|common_dir| {
         // A *linked* worktree's common dir lives in the repo's main working tree,
         // so it is never inside this checkout's own folder. `common_dir` is
@@ -11734,13 +11823,22 @@ mod cwd_test {
             descendant_git_cwd: Some(other.clone()),
             descendant_git_root: Some(other.clone()),
         };
-        app.apply_cwd_scan(vec![(pane, evidence.clone())], Vec::new());
+        let git_roots = vec![crate::git::GitRootInfo {
+            root: other.clone(),
+            branch: None,
+            worktree: None,
+        }];
+        app.apply_cwd_scan(
+            vec![(pane, evidence.clone())],
+            Vec::new(),
+            git_roots.clone(),
+        );
         let (src, _, _) = app.pane_tab_home(pane).expect("pane has a tab");
         assert!(
             crate::platform::same_path(&app.workspaces[src].cwd, &home),
             "one scan of a descendant git cwd must not move the tab"
         );
-        app.apply_cwd_scan(vec![(pane, evidence)], Vec::new());
+        app.apply_cwd_scan(vec![(pane, evidence)], Vec::new(), git_roots);
         let (dest, _, _) = app.pane_tab_home(pane).expect("pane still has a tab");
         assert!(
             crate::platform::same_path(&app.workspaces[dest].cwd, &other),

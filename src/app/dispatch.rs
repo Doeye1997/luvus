@@ -500,11 +500,30 @@ impl App {
             std::thread::spawn(move || {
                 let pids: Vec<u32> = panes.iter().map(|(_, pid)| *pid).collect();
                 let evidence = crate::platform::scan_pane_cwds(&pids);
-                let pane_results = panes
+                let pane_results: Vec<(PaneId, crate::platform::PaneCwdEvidence)> = panes
                     .into_iter()
                     .zip(evidence)
                     .map(|((id, _), ev)| (id, ev))
                     .collect();
+                let mut git_roots = Vec::new();
+                for (_, evidence) in &pane_results {
+                    for root in evidence
+                        .owner_git_root
+                        .iter()
+                        .chain(evidence.descendant_git_root.iter())
+                    {
+                        if git_roots.iter().any(|info: &crate::git::GitRootInfo| {
+                            crate::platform::same_path(&info.root, root)
+                        }) {
+                            continue;
+                        }
+                        git_roots.push(crate::git::GitRootInfo {
+                            root: root.clone(),
+                            branch: super::git_branch(root),
+                            worktree: super::worktree_membership(root),
+                        });
+                    }
+                }
                 let branches = workspaces
                     .into_iter()
                     .map(|(id, cwd)| (id, super::git_branch(&cwd)))
@@ -512,6 +531,7 @@ impl App {
                 let _ = tx.send(AppEvent::CwdScanned {
                     panes: pane_results,
                     branches,
+                    git_roots,
                 });
             });
             // Keep the FILES dock rooted at the active node and its open dirs

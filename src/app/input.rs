@@ -496,7 +496,11 @@ impl App {
             // exit changes the visible sidebar immediately. `apply_proc_scan`
             // distinguishes those cases so the common scan stays render-free.
             AppEvent::ProcScanned(found) => self.apply_proc_scan(found),
-            AppEvent::CwdScanned { panes, branches } => self.apply_cwd_scan(panes, branches),
+            AppEvent::CwdScanned {
+                panes,
+                branches,
+                git_roots,
+            } => self.apply_cwd_scan(panes, branches, git_roots),
             // Mission Control usage (docs/54, MC-2): swap in the fresh cache; the
             // mission render blits it. Repaint so a visible mission tab updates.
             AppEvent::UsageScanned { usage, mtimes } => {
