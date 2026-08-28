@@ -74,10 +74,13 @@ there.
 
 ## Windows: what's different?
 
-Use Windows Terminal. Live per-pane cwd tracking and the shell hook aren't
-available, and luvus cannot inspect a pane's processes, so it identifies agents
-from the command, window title, and screen text instead. Zero-config agent
-resume still works. Named pipes replace Unix sockets transparently.
+Use Windows Terminal. Pane working directories are read from the process, so
+[cwd rehome](/docs/guides/layout/#following-a-panes-working-directory) works
+the same as on macOS and Linux. The shell integration hook is not available.
+PowerShell `Set-Location` may not update the process current directory luvus
+reads; `cd` in `cmd.exe` typically does. Agent identity still comes from the
+command, window title, and screen text. Zero-config agent resume still works.
+Named pipes replace Unix sockets transparently.
 
 ## The terminal shows "◱ enlarge terminal"
 

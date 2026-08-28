@@ -114,9 +114,12 @@ Pick whichever channel you prefer:
     ```
     Or download the `…-x86_64-pc-windows-msvc.zip` from the
     [releases page](https://github.com/RizRiyz/luvus/releases) and put
-    `luvus.exe` on your `PATH`. Run luvus inside **Windows Terminal**. Live
-    cwd tracking and the shell integration hook aren't available on Windows,
-    but agent session resume still works.
+    `luvus.exe` on your `PATH`. Run luvus inside **Windows Terminal**. Pane cwd
+    tracking uses the process current directory, so tabs can rehome after `cd`
+    the same way they do on macOS and Linux (see
+    [Following a pane's working directory](/docs/guides/layout/#following-a-panes-working-directory)).
+    The shell integration hook is not available. Agent session resume still
+    works.
   </TabItem>
 </Tabs>
 

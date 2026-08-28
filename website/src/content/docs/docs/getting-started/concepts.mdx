@@ -51,14 +51,17 @@ known sessions without starting any server or background manager.
 
 ```
 Session
-└── Workspace   one per project folder (fixed cwd, shows its git branch)
+└── Workspace   one per project folder (shows its git branch)
     └── Tab     a layout of panes (or a special tab: git, orchestration)
         └── Pane   a real terminal running a shell or an agent
 ```
 
 - **Workspaces** are the sidebar's top list. `Ctrl+Space N` opens the folder
-  picker. Running `luvus` inside a folder adds it automatically. A workspace's
-  cwd is fixed at creation, so `cd`-ing inside a pane never moves it.
+  picker. Running `luvus` inside a folder adds it automatically. The workspace
+  folder itself stays where it was created. After `cd` into another git
+  project, luvus can move the whole tab there (and open a workspace if none
+  matches). See
+  [Following a pane's working directory](/docs/guides/layout/#following-a-panes-working-directory).
 - **Tabs** hold split layouts. Two special tabs exist: the
   [git tab](/docs/guides/git/) and the
   [orchestration board](/docs/guides/orchestration/).
