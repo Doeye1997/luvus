@@ -114,6 +114,10 @@ pub struct OrchState {
     next_task: u64,
     #[serde(default)]
     next_lease: u64,
+    /// Captured at load so later `save()` does not follow a process-global
+    /// session-dir change. Empty only on `Default` (in-memory, no persistence).
+    #[serde(skip)]
+    persist_path: PathBuf,
 }
 
 /// Why a mutation was rejected — carried to the API as a `(code, message)` error.
@@ -423,16 +427,26 @@ impl OrchState {
     // ── persistence (separate file; never touches session.json) ────────────
 
     pub fn load() -> OrchState {
-        match std::fs::read_to_string(orch_path()) {
+        Self::load_from(persist_path())
+    }
+
+    pub fn load_from(path: PathBuf) -> OrchState {
+        let mut state = match std::fs::read_to_string(&path) {
             Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
             Err(_) => OrchState::default(),
-        }
+        };
+        state.persist_path = path;
+        state
     }
 
     /// Atomic save (temp + rename), best-effort — a failed write never breaks
     /// the app; the ledger is a convenience layer, not core session state.
+    /// `Default` (empty `persist_path`) is in-memory only and does not write.
     pub fn save(&self) {
-        let path = orch_path();
+        let path = &self.persist_path;
+        if path.as_os_str().is_empty() {
+            return;
+        }
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
@@ -441,13 +455,34 @@ impl OrchState {
         };
         let tmp = path.with_extension("json.tmp");
         if std::fs::write(&tmp, json).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
+            let _ = std::fs::rename(&tmp, path);
         }
     }
 }
 
-fn orch_path() -> PathBuf {
-    crate::persist::session_dir().join("orch.json")
+fn persist_path() -> PathBuf {
+    #[cfg(test)]
+    {
+        isolated_test_persist_path()
+    }
+    #[cfg(not(test))]
+    {
+        crate::persist::session_dir().join("orch.json")
+    }
+}
+
+/// Each `load()` in the test binary gets its own file so a test that never
+/// takes `test_env` cannot read or write whichever `$LUVUS_HOME` is currently
+/// active on another thread.
+#[cfg(test)]
+fn isolated_test_persist_path() -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    std::env::temp_dir().join(format!(
+        "luvus-orch-test-{}-{}.json",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ))
 }
 
 fn unix_now() -> u64 {
@@ -717,5 +752,63 @@ mod tests {
         assert!(!paths_overlap("src/auth/**", "src/api/**"));
         assert!(!paths_overlap("src/a", "src/ab")); // segment boundary
         assert!(paths_overlap("src", "src/anything/deep"));
+    }
+
+    #[test]
+    fn load_from_roundtrips_through_an_explicit_path() {
+        let dir = std::env::temp_dir().join(format!("luvus-orch-roundtrip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("orch.json");
+        let mut a = OrchState::load_from(path.clone());
+        a.add_task("auth".into(), vec![], vec![], None).unwrap();
+        a.save();
+        let b = OrchState::load_from(path);
+        assert_eq!(b.tasks.len(), 1);
+        assert_eq!(b.tasks[0].title, "auth");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_isolates_each_ledger_in_tests() {
+        let mut a = OrchState::load();
+        a.add_task("polluter".into(), vec![], vec![], None).unwrap();
+        a.save();
+        let b = OrchState::load();
+        assert!(
+            b.tasks.is_empty(),
+            "a later load must not pick up another ledger"
+        );
+    }
+
+    #[test]
+    fn save_stays_on_the_path_captured_at_load() {
+        let dir = std::env::temp_dir().join(format!("luvus-orch-captured-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("orch.json");
+        let mut a = OrchState::load_from(path.clone());
+        let _env = crate::persist::test_env("orch-captured-path");
+        a.add_task("stays".into(), vec![], vec![], None).unwrap();
+        a.save();
+        assert!(path.exists(), "saved to the captured path");
+        let leaked = crate::persist::session_dir().join("orch.json");
+        assert!(
+            !leaked.exists(),
+            "must not follow a later $LUVUS_HOME into session_dir"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn default_save_is_a_no_op() {
+        let _env = crate::persist::test_env("orch-default-noop");
+        let mut s = OrchState::default();
+        s.add_task("ghost".into(), vec![], vec![], None).unwrap();
+        s.save();
+        assert!(
+            !crate::persist::session_dir().join("orch.json").exists(),
+            "in-memory Default must not write the session ledger"
+        );
     }
 }
