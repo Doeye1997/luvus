@@ -325,6 +325,13 @@ impl App {
                     );
                     return true;
                 }
+                // The worker may finish after the last workspace closes. Drop
+                // its stale result, but release the guard so CWD tracking can
+                // start again if another workspace is opened.
+                AppEvent::CwdScanned { .. } => {
+                    self.cwd_scan_inflight = false;
+                    return false;
+                }
                 // Closing the last workspace empties `workspaces` and sets
                 // `should_quit`; the loop drains the rest of the event batch
                 // before it checks that flag, so ignore everything else here
@@ -3121,6 +3128,27 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(1))
             .expect("an empty server still answers its control API");
         assert!(resp.contains("pong"), "got a real pong, not EOF: {resp}");
+    }
+
+    #[test]
+    fn discarded_cwd_scan_releases_the_inflight_guard() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        app.cwd_scan_inflight = true;
+        app.close_workspace(0);
+        assert!(app.workspaces.is_empty(), "the only workspace is gone");
+
+        let dirty = app.handle_event(AppEvent::CwdScanned {
+            panes: Vec::new(),
+            branches: Vec::new(),
+            workspace_candidates: Vec::new(),
+        });
+
+        assert!(!dirty, "discarding an invisible scan needs no repaint");
+        assert!(
+            !app.cwd_scan_inflight,
+            "a reopened workspace must be allowed to start another scan"
+        );
     }
 
     #[test]
