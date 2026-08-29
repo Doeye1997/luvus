@@ -1150,8 +1150,8 @@ fn run(terminal: &mut DefaultTerminal) -> Result<bool> {
     let startup_lock = ipc::transport::acquire_server_startup_lock(&state_dir)?;
     let sock = persist::socket_path();
     let client_sock = persist::client_socket_path();
-    if ipc::transport::connect_timeout(&sock, Duration::from_millis(50)).is_ok()
-        || ipc::transport::connect_timeout(&client_sock, Duration::from_millis(50)).is_ok()
+    if ipc::transport::endpoint_exists(&sock, Duration::from_millis(50))
+        || ipc::transport::endpoint_exists(&client_sock, Duration::from_millis(50))
     {
         return Err(anyhow!(
             "a Luvus server is already active for {}; use `luvus` to attach to it",
