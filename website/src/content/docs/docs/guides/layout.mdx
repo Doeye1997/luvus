@@ -89,6 +89,15 @@ live in the sidebar's top list.
 - **Jump to its git tab:** right-click the workspace and choose **Open Git
   Tab**, or focus it and press `Ctrl+Space g`.
 
+### Following a pane into another repository
+
+When a terminal or agent changes its working directory into another Git
+repository or linked worktree, luvus confirms the new root across two scans and
+then moves the complete normal tab to that workspace. If the workspace is not
+open yet, luvus creates it without starting another shell. Split tabs move only
+when every pane agrees on the same destination; mixed-workspace splits and
+dashboard tabs stay where they are.
+
 ### Right-click a workspace
 
 Right-click any workspace row for its menu:
