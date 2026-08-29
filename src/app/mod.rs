@@ -129,7 +129,8 @@ pub enum ViewKind {
 }
 
 /// Which sidebar a dock lives in (docs/29).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Side {
     Left,
     Right,
@@ -255,6 +256,9 @@ impl SideState {
 pub struct Sidebars {
     pub left: SideState,
     pub right: SideState,
+    /// Last explicit FILES placement. Unlike the mounted dock vectors, this
+    /// survives turning FILES off so the toggle can restore the user's side.
+    pub files_side: Side,
 }
 
 impl Sidebars {
@@ -271,15 +275,26 @@ impl Sidebars {
         }
     }
     fn from_config(cfg: &crate::config::SidebarsConfig) -> Sidebars {
+        let left = SideState::from_config(&cfg.left);
+        let right = SideState::from_config(&cfg.right);
+        let files_side = if left.has(&DockKind::Files) {
+            Side::Left
+        } else if right.has(&DockKind::Files) {
+            Side::Right
+        } else {
+            cfg.files_side.unwrap_or(Side::Left)
+        };
         Sidebars {
-            left: SideState::from_config(&cfg.left),
-            right: SideState::from_config(&cfg.right),
+            left,
+            right,
+            files_side,
         }
     }
     fn to_config(&self) -> crate::config::SidebarsConfig {
         crate::config::SidebarsConfig {
             left: self.left.to_config(),
             right: self.right.to_config(),
+            files_side: Some(self.files_side),
         }
     }
     /// Whether `side` has a free dock slot (below `MAX_DOCKS_PER_SIDE`, docs/29).
@@ -590,7 +605,7 @@ pub enum DiffMenuItem {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum FileMenuItem {
-    /// Open in the native read-only viewer (files only).
+    /// Open in the native read-only viewer, in its own tab (files only).
     OpenReadonly,
     /// Open with editor `editors[i]` (files only).
     OpenWith(usize),
@@ -598,6 +613,9 @@ pub enum FileMenuItem {
     NewFolder,
     Rename,
     CopyPath,
+    /// Type the path into the focused pane's prompt, without submitting it
+    /// (docs/38 FILE-6). Offered for folders too, exactly like `CopyPath`.
+    InsertPath,
     Divider,
     Delete,
 }
@@ -617,6 +635,7 @@ impl FileMenu {
             FileMenuItem::NewFolder,
             FileMenuItem::Rename,
             FileMenuItem::CopyPath,
+            FileMenuItem::InsertPath,
             FileMenuItem::Divider,
             FileMenuItem::Delete,
         ]);
@@ -641,6 +660,18 @@ pub enum FilePromptKind {
     NewFile,
     NewFolder,
     Rename,
+}
+
+/// What a terminal-editor pane is editing (docs/38): the file, and the editor
+/// run-command it was launched with. The command is part of the record because
+/// `Open With` can aim a *second*, different editor at a file that is already
+/// open in one — re-opening the same editor focuses the running tab, a
+/// different one is an explicit override and still launches.
+pub struct EditorFile {
+    pub path: PathBuf,
+    /// A run-command such as `"vim"` or `"emacs -nw"`, exactly as it appears in
+    /// `App::editors`.
+    pub command: String,
 }
 
 /// Cap a file-tree name entry (same spirit as [`TAB_NAME_MAX`]).
@@ -1062,8 +1093,9 @@ impl PaneStatus {
 pub enum LinkTarget {
     /// Hand to the client's browser.
     Url(String),
-    /// Open in luvus's own viewer or editor, exactly like a FILES click (docs/38),
-    /// jumping to `line` when the reference carried one.
+    /// Open in luvus's own viewer or editor in a tab (docs/38), jumping to
+    /// `line` when the reference carried one. Always a tab: `File click
+    /// behavior` governs the FILES tree, not path activation.
     File { path: PathBuf, line: Option<u32> },
 }
 
@@ -1202,6 +1234,12 @@ impl Selection {
     }
 }
 
+/// Ceiling for copy mode's typed count. Row and column motions are O(1), but a
+/// word motion walks the grid a step at a time, so an accidental `9999999w`
+/// would hold the engine lock the PTY reader needs. Four digits covers a jump
+/// across a full scrollback and keeps the worst case bounded.
+pub const COPY_COUNT_MAX: usize = 9_999;
+
 /// Keyboard-driven selection in a terminal pane. Rows are absolute indices in
 /// retained-row coordinates (oldest retained row is zero), so the selection remains
 /// stable while its viewport scrolls.
@@ -1212,6 +1250,9 @@ pub struct CopyMode {
     pub cursor: (usize, usize),
     /// The viewport to restore when the user cancels instead of copying.
     pub saved_scroll: usize,
+    /// Digits typed since the last motion — vim's count prefix, so `12j` moves
+    /// twelve rows. Zero means "no count typed", which every motion reads as 1.
+    pub pending_count: usize,
 }
 
 impl CopyMode {
@@ -1223,6 +1264,22 @@ impl CopyMode {
         }
     }
 
+    /// How many times the next motion repeats. A typed count of zero means the
+    /// user typed none, and every motion still has to move once.
+    pub(crate) fn count(&self) -> usize {
+        self.pending_count.max(1)
+    }
+
+    /// Append a typed digit, saturating at [`COPY_COUNT_MAX`] so a leaned-on
+    /// key cannot turn one motion into unbounded scanning work.
+    pub(crate) fn push_count_digit(&mut self, digit: usize) {
+        self.pending_count = self
+            .pending_count
+            .saturating_mul(10)
+            .saturating_add(digit)
+            .min(COPY_COUNT_MAX);
+    }
+
     pub(crate) fn contains(&self, row: usize, col: usize) -> bool {
         let ((sr, sc), (er, ec)) = self.ordered();
         if row < sr || row > er {
@@ -1231,6 +1288,105 @@ impl CopyMode {
         let left = if row == sr { sc } else { 0 };
         let right = if row == er { ec } else { usize::MAX };
         col >= left && col <= right
+    }
+}
+
+/// Which popup a menu scroll offset belongs to. A submenu scrolls independently
+/// of the menu that opened it, so the two have separate ids.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum PopupId {
+    Ws,
+    Tab,
+    TabSwap,
+    Pane,
+    PaneMove,
+    Agent,
+    Diff,
+    File,
+    Dock,
+}
+
+/// Scroll state for context menus taller than the space they are drawn in.
+///
+/// `render_popup` used to stop laying rows out once it ran out of height, and a
+/// row with no rect is unclickable rather than merely unpainted — so the actions
+/// a menu puts last went silently missing in a short or compact session. The
+/// rows scroll now instead.
+///
+/// Context menus are mouse-only — there is no keyboard route into one — so the
+/// wheel over the popup is the whole gesture, and this is the state it needs.
+#[derive(Default)]
+pub struct MenuScroll {
+    /// Rows scrolled off the top, per popup.
+    offsets: std::collections::HashMap<PopupId, usize>,
+    /// Where each popup was drawn this frame and how far it can scroll. A wheel
+    /// event hit-tests against these, so it moves the popup under the cursor
+    /// rather than whichever menu happens to be open.
+    frames: Vec<(PopupId, Rect, usize)>,
+}
+
+impl MenuScroll {
+    /// Start a frame. Last frame's geometry is stale, and a popup that is no
+    /// longer drawn forgets its offset — so reopening a menu starts at the top
+    /// rather than wherever the last one was left.
+    pub fn begin_frame(&mut self) {
+        let drawn = std::mem::take(&mut self.frames);
+        self.offsets
+            .retain(|id, _| drawn.iter().any(|(drawn_id, _, _)| drawn_id == id));
+    }
+
+    /// Record where a popup was drawn and how far it can scroll, returning the
+    /// offset to draw it at. Clamped, so a menu that grew shorter — or a window
+    /// that grew taller — cannot leave it scrolled past its last row.
+    pub fn record(&mut self, id: PopupId, popup: Rect, max: usize) -> usize {
+        let offset = self.offsets.get(&id).copied().unwrap_or(0).min(max);
+        self.offsets.insert(id, offset);
+        self.frames.push((id, popup, max));
+        offset
+    }
+
+    /// Scroll the popup under `(column, row)`, if there is one. Returns whether
+    /// a popup took the event, so the wheel goes on doing what it did before
+    /// everywhere else.
+    pub fn wheel(&mut self, column: u16, row: u16, delta: i32) -> bool {
+        // Last drawn wins, the way the paint does: a submenu is anchored beside
+        // its parent but clamped back on screen at the right edge, where it
+        // lands on top of it. Searching forward would hand the wheel to the
+        // parent the submenu is covering.
+        let Some((id, _, max)) = self.frames.iter().rev().copied().find(|(_, rect, _)| {
+            column >= rect.x && column < rect.right() && row >= rect.y && row < rect.bottom()
+        }) else {
+            return false;
+        };
+        // A menu that fits still owns the wheel: scrolling the pane behind an
+        // open popup is not what the gesture means.
+        if max > 0 {
+            let now = self.offsets.get(&id).copied().unwrap_or(0) as i32;
+            let next = (now + delta).clamp(0, max as i32) as usize;
+            self.offsets.insert(id, next);
+        }
+        true
+    }
+
+    /// A press that is not on an open popup: whatever menu it opens (or
+    /// dismisses) starts at the top next time. Menus have no other identity to
+    /// key an offset on — the same popup id is reused for every file you
+    /// right-click — and a press outside is what opens and closes them, so it is
+    /// the honest moment to forget where the last one was scrolled to.
+    pub fn press(&mut self, column: u16, row: u16) {
+        let on_popup = self.frames.iter().any(|(_, rect, _)| {
+            column >= rect.x && column < rect.right() && row >= rect.y && row < rect.bottom()
+        });
+        if !on_popup {
+            self.offsets.clear();
+        }
+    }
+
+    /// The offset a popup is drawn at. Tests read this; the renderer gets it
+    /// back from [`MenuScroll::record`].
+    #[cfg(test)]
+    pub fn offset_of(&self, id: PopupId) -> usize {
+        self.offsets.get(&id).copied().unwrap_or(0)
     }
 }
 
@@ -1435,9 +1591,9 @@ pub struct App {
     /// Notification messages queued by detection; the loop flushes them to the
     /// terminal (bell + desktop) and clears.
     pub pending_notify: Vec<String>,
-    /// Set when an agent just finished (transition to Done); the loop plays the
-    /// retro "done" jingle once and clears it.
-    pub pending_sound: bool,
+    /// Coalesced notification cue waiting for the client. A blocked cue takes
+    /// priority over a completion cue when both arrive before the next flush.
+    pub pending_sound: Option<crate::sound::SoundSignal>,
     /// Active mouse text selection in a pane (drag to select). Cleared on a new
     /// click; on release its text is queued to `pending_clipboard`.
     pub selection: Option<Selection>,
@@ -1467,6 +1623,15 @@ pub struct App {
     /// gesture dragged is the RESIZE-5 divider grab: moving off the cell hands
     /// the press over to the resize, releasing on it opens the link.
     pub link_press: Option<LinkPress>,
+    /// The last left press (pane + screen cell + when), for detecting a
+    /// double-click. A second left press within the double-click window, in the
+    /// same pane's content and on the same cell (±1), copies the path / URL / word
+    /// under the cursor. Armed only for a press inside pane content, so a
+    /// title/border click never turns a following body click into a double-click.
+    pub last_left_click: Option<(PaneId, (u16, u16), Instant)>,
+    /// Set between a double-click's press (which already copied) and its release,
+    /// so the release keeps the highlighted token instead of re-copying it.
+    pub dbl_click_release: bool,
     /// A transient toast (text, expiry) shown bottom-center — e.g. "Copied".
     pub toast: Option<(String, Instant)>,
     /// Downsample RGB → 256-color (for the local path on non-truecolor terms).
@@ -1623,7 +1788,7 @@ pub struct App {
     /// with the file exactly like a read-only view tab. Deliberately not
     /// persisted — after a restart the pane is no longer that editor, so the
     /// label must not survive it. Untracked in `drop_leaf_runtime`.
-    pub editor_files: HashMap<PaneId, PathBuf>,
+    pub editor_files: HashMap<PaneId, EditorFile>,
     /// Most recently opened files, newest first, scoped by workspace folder.
     /// This is a small in-memory finder convenience and is never persisted.
     pub recent_files: VecDeque<(PathBuf, PathBuf)>,
@@ -1638,6 +1803,9 @@ pub struct App {
     pub last_active_ws_shown: usize,
     /// Last mouse position, for hover affordances (the session delete ✕).
     pub hover: Option<(u16, u16)>,
+    /// Scroll offsets for context-menu popups that do not fit (see
+    /// [`MenuScroll`]), and the geometry a wheel event hit-tests against.
+    pub menu_scroll: MenuScroll,
     app_tx: Sender<AppEvent>,
     pub last_pane_area: Rect,
     // Hit-test geometry from the last render, for mouse clicks.
@@ -1891,7 +2059,7 @@ impl App {
             end_session: false,
             force_redraw: false,
             pending_notify: Vec::new(),
-            pending_sound: false,
+            pending_sound: None,
             selection: None,
             copy_mode: None,
             mouse_grab: None,
@@ -1900,6 +2068,8 @@ impl App {
             link_scan_at: None,
             hover_link: None,
             link_press: None,
+            last_left_click: None,
+            dbl_click_release: false,
             toast: None,
             downsample: false,
             last_cwd_at: Instant::now(),
@@ -1992,6 +2162,7 @@ impl App {
             switcher_close_rect: None,
             last_active_ws_shown: 0,
             hover: None,
+            menu_scroll: MenuScroll::default(),
             app_tx,
             last_pane_area: Rect::ZERO,
             pane_rects: Vec::new(),
@@ -2133,15 +2304,22 @@ impl App {
                     // A file-view leaf (docs/38 FILE-3): rebuild the view and
                     // re-read the file off-loop; no PTY is spawned.
                     if let Some(path) = &ps.file {
-                        views.insert(
-                            id,
-                            ViewKind::File(crate::files::FileView::new(path.clone())),
-                        );
+                        let mut view = crate::files::FileView::new(path.clone());
+                        // The read spawned below is this view's first, so it
+                        // carries token 1 and the view waits for exactly that.
+                        // (0 stays "nothing scheduled", which matches nothing.)
+                        view.read_token = 1;
+                        views.insert(id, ViewKind::File(view));
                         let tx = app_tx.clone();
                         let p = path.clone();
                         std::thread::spawn(move || {
                             let load = crate::files::read_file(&p);
-                            let _ = tx.send(crate::event::AppEvent::FileRead { id, load });
+                            let _ = tx.send(crate::event::AppEvent::FileRead {
+                                id,
+                                path: p,
+                                token: 1,
+                                load,
+                            });
                         });
                         remap.insert(*raw, id);
                         continue;
@@ -2433,7 +2611,7 @@ impl App {
             end_session: false,
             force_redraw: false,
             pending_notify: Vec::new(),
-            pending_sound: false,
+            pending_sound: None,
             selection: None,
             copy_mode: None,
             mouse_grab: None,
@@ -2442,6 +2620,8 @@ impl App {
             link_scan_at: None,
             hover_link: None,
             link_press: None,
+            last_left_click: None,
+            dbl_click_release: false,
             toast: None,
             downsample: false,
             last_cwd_at: Instant::now(),
@@ -2534,6 +2714,7 @@ impl App {
             switcher_close_rect: None,
             last_active_ws_shown: 0,
             hover: None,
+            menu_scroll: MenuScroll::default(),
             app_tx,
             last_pane_area: Rect::ZERO,
             pane_rects: Vec::new(),
@@ -2663,6 +2844,9 @@ impl App {
         let dst = self.sidebars.get_mut(target);
         if !dst.docks.contains(kind) {
             dst.docks.push(kind.clone());
+        }
+        if kind == &DockKind::Files {
+            self.sidebars.files_side = target;
         }
         // Placing a module dock on a side is the user opting it back in, so clear
         // any explicit "off" flag (the inverse of `unmount_dock`).
@@ -10105,8 +10289,8 @@ mod tests {
         assert_ne!(f0, f1, "the spinner advances with app.spinner");
     }
 
-    // An agent that finishes a working stretch (Working → Idle) queues the retro
-    // chime, whether or not its pane is focused.
+    // An agent that finishes a working stretch (Working → Idle) queues the
+    // selected completion cue, whether or not its pane is focused.
     #[test]
     fn agent_finish_plays_sound() {
         let _env = crate::persist::test_env("chime");
@@ -10132,10 +10316,11 @@ mod tests {
         });
         app.status.insert(pid, ps);
 
-        assert!(!app.pending_sound);
+        assert!(app.pending_sound.is_none());
         app.detect_tick(now);
-        assert!(
-            app.pending_sound,
+        assert_eq!(
+            app.pending_sound.map(|signal| signal.cue),
+            Some(crate::sound::SoundCue::Done),
             "an agent finishing its working stretch plays the chime"
         );
     }
@@ -10437,6 +10622,7 @@ mod tests {
                 width: 26,
                 docks: Vec::new(),
             },
+            files_side: None,
         };
         let sidebars = Sidebars::from_config(&cfg);
         assert_eq!(
@@ -11042,23 +11228,33 @@ mod tests {
         // Off by default: the same transition stays silent.
         app.status.get_mut(&id).unwrap().state = State::Idle;
         app.detect_tick(t0);
-        assert!(!app.pending_sound, "sound on blocked is off by default");
+        assert!(
+            app.pending_sound.is_none(),
+            "sound on blocked is off by default"
+        );
 
         // Enabled → a transition to Blocked rings once…
         app.config.notifications.sound_on_blocked = true;
         app.status.get_mut(&id).unwrap().state = State::Idle; // re-run the transition
         app.detect_tick(t0 + Duration::from_millis(200));
-        assert!(app.pending_sound, "blocked transition rings when enabled");
+        assert_eq!(
+            app.pending_sound.map(|signal| signal.cue),
+            Some(crate::sound::SoundCue::Blocked),
+            "blocked transition rings when enabled"
+        );
 
         // …and is disarmed: a flap back into Blocked doesn't ring again until
         // the user looks at the pane (focus re-arms; this pane is focused, so
         // simulate the unfocused case by moving focus away).
-        app.pending_sound = false;
+        app.pending_sound = None;
         let bogus = PaneId::alloc();
         app.layout_mut().focus = bogus; // unfocused → no auto re-arm
         app.status.get_mut(&id).unwrap().state = State::Idle;
         app.detect_tick(t0 + Duration::from_millis(400));
-        assert!(!app.pending_sound, "an ignored prompt doesn't ring twice");
+        assert!(
+            app.pending_sound.is_none(),
+            "an ignored prompt doesn't ring twice"
+        );
     }
 
     // A bursty/streaming agent has long pauses *within* one turn. The debounce
@@ -11125,17 +11321,21 @@ mod tests {
         app.detect_tick(t0); // candidate=Done, but not yet committed
         app.detect_tick(t0 + Duration::from_millis(500));
         assert_eq!(state(&app), State::Working, "a short pause stays Working");
-        assert!(!app.pending_sound, "a short pause does not chime");
+        assert!(app.pending_sound.is_none(), "a short pause does not chime");
 
         // (2) Sustained quiet past the dwell → Done, chiming.
         app.detect_tick(t0 + QUIET_DWELL + Duration::from_millis(100));
         assert_eq!(state(&app), State::Done, "sustained quiet commits Done");
-        assert!(app.pending_sound, "a genuine completion chimes");
+        assert_eq!(
+            app.pending_sound.map(|signal| signal.cue),
+            Some(crate::sound::SoundCue::Done),
+            "a genuine completion chimes"
+        );
 
         // (3) Work again, then complete again → a second genuine finish chimes
         // too (the chime is per finish; the debounce is what stops mid-turn
         // pauses from ringing).
-        app.pending_sound = false;
+        app.pending_sound = None;
         let t1 = t0 + QUIET_DWELL + Duration::from_millis(300);
         go_working(&mut app, t1); // spinner back on screen → Working
         app.detect_tick(t1); // commits Working instantly
@@ -11152,7 +11352,11 @@ mod tests {
             State::Done,
             "second completion still reaches Done"
         );
-        assert!(app.pending_sound, "each real finish chimes");
+        assert_eq!(
+            app.pending_sound.map(|signal| signal.cue),
+            Some(crate::sound::SoundCue::Done),
+            "each real finish chimes"
+        );
     }
 
     // Keyboard scroll mode: Shift+↑ enters, plain keys navigate the scrollback
@@ -11279,6 +11483,7 @@ mod tests {
             anchor: (row, 0),
             cursor: (row, 0),
             saved_scroll: 0,
+            pending_count: 0,
         });
 
         for _ in 0..3 {
@@ -11323,6 +11528,7 @@ mod tests {
             anchor: (row, 0),
             cursor: (row, 0),
             saved_scroll: 0,
+            pending_count: 0,
         });
 
         let send = |app: &mut App, character| {
@@ -11337,6 +11543,327 @@ mod tests {
         assert_eq!(app.copy_mode.expect("copy mode").cursor, (row, 0));
         send(&mut app, '$');
         assert_eq!(app.copy_mode.expect("copy mode").cursor, (row, 9));
+    }
+
+    /// Copy mode's reference block in Settings -> Keys and its key handler have
+    /// to stay in step, and nothing else notices when they drift apart. The
+    /// parity test only counts rows against descriptions, so dropping a row
+    /// together with its eight translations keeps it quiet, and the clipping
+    /// test walks whatever rows happen to exist. That pairing is how copy mode
+    /// shipped without a `g / G` row while scroll mode carried one all along.
+    ///
+    /// Each case names a motion family, the key that leads it, and the change
+    /// that proves the handler still answers. Aliases stay out on purpose: `f`,
+    /// `Home`, `End`, the page keys, and the ctrl variants all work without
+    /// rows of their own, because the panel is a curated subset whose key
+    /// column has a width budget to respect.
+    #[test]
+    fn every_copy_mode_motion_family_has_a_reference_row_and_a_live_handler() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        #[derive(Clone, Copy)]
+        enum Proves {
+            Row,
+            Column,
+            Count,
+            Anchor,
+            Exit,
+        }
+
+        let cases = [
+            ("hjkl", KeyCode::Char('j'), KeyModifiers::NONE, Proves::Row),
+            (
+                "w / e / B",
+                KeyCode::Char('w'),
+                KeyModifiers::NONE,
+                Proves::Column,
+            ),
+            (
+                "Space / b",
+                KeyCode::Char(' '),
+                KeyModifiers::NONE,
+                Proves::Row,
+            ),
+            (
+                "^D / ^U",
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL,
+                Proves::Row,
+            ),
+            ("g / G", KeyCode::Char('G'), KeyModifiers::NONE, Proves::Row),
+            (
+                "1\u{2013}9",
+                KeyCode::Char('3'),
+                KeyModifiers::NONE,
+                Proves::Count,
+            ),
+            ("v", KeyCode::Char('v'), KeyModifiers::NONE, Proves::Anchor),
+            ("y", KeyCode::Enter, KeyModifiers::NONE, Proves::Exit),
+            ("q", KeyCode::Esc, KeyModifiers::NONE, Proves::Exit),
+        ];
+
+        let rows = crate::i18n::settings::KEY_REFERENCE_KEYS[2];
+        let _env = crate::persist::test_env("copy-mode-families");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(40, 8, tx).unwrap();
+        let pane = app.layout().focus;
+        if let Some(p) = app.panes.get(&pane) {
+            if let Ok(mut engine) = p.engine.lock() {
+                for i in 0..30 {
+                    engine.advance(format!("row {i} alpha beta gamma\r\n").as_bytes());
+                }
+            }
+        }
+        let mid = app.panes.get(&pane).expect("pane").retained_row_count() / 2;
+
+        for (label, code, mods, proves) in cases {
+            assert!(
+                rows.iter().any(|row| row.contains(label)),
+                "copy mode's reference block lost its {label} row"
+            );
+
+            // `v` only shows its work when the anchor sits away from the cursor.
+            let anchor = if matches!(proves, Proves::Anchor) {
+                (mid.saturating_sub(2), 0)
+            } else {
+                (mid, 4)
+            };
+            let start = CopyMode {
+                pane,
+                anchor,
+                cursor: (mid, 4),
+                saved_scroll: 0,
+                pending_count: 0,
+            };
+            app.copy_mode = Some(start);
+            app.handle_event(crate::event::AppEvent::Key(KeyEvent::new(code, mods)));
+
+            if matches!(proves, Proves::Exit) {
+                assert!(
+                    app.copy_mode.is_none(),
+                    "{label} no longer leaves copy mode"
+                );
+                continue;
+            }
+            let Some(now) = app.copy_mode else {
+                panic!("{label} left copy mode instead of moving");
+            };
+            let answered = match proves {
+                Proves::Row => now.cursor.0 != start.cursor.0,
+                Proves::Column => now.cursor.1 != start.cursor.1,
+                Proves::Count => now.pending_count != 0,
+                Proves::Anchor => now.anchor == now.cursor,
+                Proves::Exit => unreachable!("handled above"),
+            };
+            assert!(answered, "{label} no longer answers in copy mode");
+        }
+    }
+
+    #[test]
+    fn copy_mode_word_end_stops_on_the_last_cell_of_each_word() {
+        let _env = crate::persist::test_env("copy-mode-word-end");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(40, 8, tx).unwrap();
+        let pane = app.layout().focus;
+        app.panes
+            .get(&pane)
+            .expect("pane")
+            .engine
+            .lock()
+            .expect("engine")
+            .advance("\x1b[H\x1b[2J你好 world again\r\na bb ccc".as_bytes());
+        let mut target_row = None;
+        let mut narrow_row = None;
+        app.panes
+            .get(&pane)
+            .expect("pane")
+            .for_each_retained_row(&mut |row, _, _, text| {
+                if text == "你好 world again" {
+                    target_row = Some(row);
+                }
+                if text == "a bb ccc" {
+                    narrow_row = Some(row);
+                }
+            });
+        let row = target_row.expect("fixture row");
+        let narrow = narrow_row.expect("single-cell fixture row");
+        let start = CopyMode {
+            pane,
+            anchor: (row, 0),
+            cursor: (row, 0),
+            saved_scroll: 0,
+            pending_count: 0,
+        };
+        app.copy_mode = Some(start);
+
+        let send = |app: &mut App, character| {
+            app.handle_event(AppEvent::Key(KeyEvent::new(
+                KeyCode::Char(character),
+                KeyModifiers::NONE,
+            )));
+        };
+
+        // Cell columns, not scalar counts: 你好 ends at column 3, `world` at 9.
+        send(&mut app, 'e');
+        assert_eq!(app.copy_mode.expect("copy mode").cursor, (row, 3));
+        send(&mut app, 'e');
+        assert_eq!(app.copy_mode.expect("copy mode").cursor, (row, 9));
+
+        // A count repeats the motion and is consumed by it.
+        app.copy_mode = Some(start);
+        send(&mut app, '2');
+        let counted = app.copy_mode.expect("copy mode");
+        assert_eq!(counted.pending_count, 2, "a digit is held for the motion");
+        assert_eq!(counted.cursor, (row, 0), "a count alone never moves");
+        send(&mut app, 'e');
+        let moved = app.copy_mode.expect("copy mode");
+        assert_eq!(moved.cursor, (row, 9), "2e lands where e e does");
+        assert_eq!(moved.pending_count, 0, "the motion consumed the count");
+
+        // A count is exactly repetition: `12e` must land where twelve presses do,
+        // including where the motion saturates. No magic column here, because the
+        // saturation point belongs to the fixture, not to the contract.
+        app.copy_mode = Some(start);
+        for _ in 0..12 {
+            send(&mut app, 'e');
+        }
+        let stepwise = app.copy_mode.expect("copy mode").cursor;
+        assert_ne!(stepwise, (row, 3), "twelve presses outrun a single step");
+
+        app.copy_mode = Some(start);
+        send(&mut app, '1');
+        send(&mut app, '2');
+        assert_eq!(
+            app.copy_mode.expect("copy mode").pending_count,
+            12,
+            "digits stack into one count instead of replacing it"
+        );
+        send(&mut app, 'e');
+        assert_eq!(
+            app.copy_mode.expect("copy mode").cursor,
+            stepwise,
+            "12e lands where twelve e presses land"
+        );
+
+        // A one-cell word leaves the cursor already sitting on its own word end,
+        // so `e` has nowhere to stop inside it and moves to the next word's end.
+        // Vim does the same: on `a bb ccc` from column 0, `e` lands on 3 and then
+        // 7, never on 0. Staying put would make `e` a dead key on short words.
+        app.copy_mode = Some(CopyMode {
+            pane,
+            anchor: (narrow, 0),
+            cursor: (narrow, 0),
+            saved_scroll: 0,
+            pending_count: 0,
+        });
+        send(&mut app, 'e');
+        assert_eq!(
+            app.copy_mode.expect("copy mode").cursor,
+            (narrow, 3),
+            "e off a one-cell word ends the next word, like vim"
+        );
+        send(&mut app, 'e');
+        assert_eq!(
+            app.copy_mode.expect("copy mode").cursor,
+            (narrow, 7),
+            "the following e keeps advancing by whole words"
+        );
+    }
+
+    #[test]
+    fn copy_mode_counts_rows_and_moves_by_half_pages() {
+        let _env = crate::persist::test_env("copy-mode-counts");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(40, 8, tx).unwrap();
+        let pane = app.layout().focus;
+        {
+            let held = app.panes.get(&pane).expect("pane");
+            let mut engine = held.engine.lock().expect("engine");
+            engine.advance(b"\x1b[H\x1b[2J");
+            for line in 0..40 {
+                engine.advance(format!("line-{line:03}\r\n").as_bytes());
+            }
+        }
+        let last_row = app
+            .panes
+            .get(&pane)
+            .expect("pane")
+            .retained_row_count()
+            .saturating_sub(1);
+        assert!(
+            last_row > 20,
+            "the fixture has real history to move through"
+        );
+        app.copy_mode = Some(CopyMode {
+            pane,
+            anchor: (0, 0),
+            cursor: (0, 0),
+            saved_scroll: 0,
+            pending_count: 0,
+        });
+
+        let send = |app: &mut App, code, mods| {
+            app.handle_event(AppEvent::Key(KeyEvent::new(code, mods)));
+        };
+        let row = |app: &App| app.copy_mode.expect("copy mode").cursor.0;
+
+        send(&mut app, KeyCode::Char('1'), KeyModifiers::NONE);
+        send(&mut app, KeyCode::Char('2'), KeyModifiers::NONE);
+        send(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(row(&app), 12, "12j moves twelve rows, not one");
+
+        // Derive half a page from the rendered pane, not from `focused_page`'s
+        // unrendered fallback: otherwise this test pins an unrelated default
+        // instead of the contract, and passes even if the page math is wrong.
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 8)).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("render");
+        let content = app
+            .pane_content_rects
+            .iter()
+            .find(|(id, _)| *id == pane)
+            .map(|(_, rect)| *rect)
+            .expect("pane content rect");
+        // A page is the content height minus one row of overlap; half rounds up.
+        let page = content.height as usize - 1;
+        let half = page.div_ceil(2).max(1);
+        assert!(
+            half < page,
+            "the fixture must distinguish a half page from a whole one"
+        );
+
+        send(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert_eq!(row(&app), 12 - half, "Ctrl+U is half a page up");
+        send(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert_eq!(row(&app), 12, "Ctrl+D is half a page down");
+
+        send(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
+        assert_eq!(row(&app), 12, "a bare d stays unbound");
+
+        // An unrecognised key must clear a pending count, or the next motion
+        // silently inherits it.
+        send(&mut app, KeyCode::Char('5'), KeyModifiers::NONE);
+        send(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        send(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(row(&app), 13, "a swallowed key drops the count it followed");
+
+        send(&mut app, KeyCode::Char('5'), KeyModifiers::NONE);
+        send(&mut app, KeyCode::Char('G'), KeyModifiers::NONE);
+        assert_eq!(row(&app), 4, "5G is vim's absolute line jump");
+
+        // `0` keeps its own meaning while no count is being typed. Asserted on a
+        // row that holds text: the newest retained row is the blank line the
+        // cursor sits on, where every column motion is already clamped to zero.
+        send(&mut app, KeyCode::Char('$'), KeyModifiers::NONE);
+        assert!(app.copy_mode.expect("copy mode").cursor.1 > 0);
+        send(&mut app, KeyCode::Char('0'), KeyModifiers::NONE);
+        let copy = app.copy_mode.expect("copy mode");
+        assert_eq!(copy.cursor, (4, 0), "0 is still the first column");
+        assert_eq!(copy.pending_count, 0, "and never starts a count");
+
+        send(&mut app, KeyCode::Char('G'), KeyModifiers::NONE);
+        assert_eq!(row(&app), last_row, "a bare G is still the newest row");
     }
 
     #[test]
@@ -11357,6 +11884,7 @@ mod tests {
             anchor: (1, 0),
             cursor: (2, 5),
             saved_scroll: 0,
+            pending_count: 0,
         });
 
         app.finish_copy_mode();

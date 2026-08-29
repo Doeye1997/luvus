@@ -208,10 +208,22 @@ pub struct LayoutConfig {
     pub new_pane_to_workspace_root: bool,
     /// Default action when a file is opened from the FILES tree (docs/38):
     /// `"readonly"` (the native viewer) or an editor run-command such as `"vim"`
-    /// / `"emacs -nw"`. A plain click uses this; Shift+click always reads it
-    /// read-only, and the right-click menu picks per file.
+    /// / `"emacs -nw"`. Consulted whenever a file opens in a *tab* — see
+    /// `file_click` for whether a plain click does that; Shift+click always
+    /// reads it read-only, and the right-click menu picks per file.
     #[serde(default = "default_file_open")]
     pub file_open: String,
+    /// What a plain left click on a FILES row does (docs/38): `"preview"` (the
+    /// default) reuses one native read-only preview pane in the active
+    /// workspace, VS Code style; `"tab"` opens a whole tab through
+    /// `layout.file_open`, which is what a click did before this setting
+    /// existed and the only mode that may launch an editor PTY. Deliberately
+    /// separate from `file_open`: that setting answers *which viewer*, this one
+    /// answers *where a click puts it*. Stored as a string rather than an enum
+    /// so a value written by a newer Luvus cannot fail the whole config's
+    /// deserialization — an unrecognized value reads back as the default.
+    #[serde(default = "default_file_click")]
+    pub file_click: String,
     /// Retained scrollback budget per pane. This is the user-facing memory dial:
     /// 10 MiB by default, regardless of how many panes are open. The Alacritty
     /// adapter derives a conservative row limit from it until the Ghostty engine
@@ -292,6 +304,10 @@ pub struct SidebarsConfig {
     pub left: SideConfig,
     #[serde(default = "SideConfig::right_default")]
     pub right: SideConfig,
+    /// Last explicit FILES placement, retained while the dock is off so the
+    /// show/hide shortcut restores it to the same side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files_side: Option<crate::app::Side>,
 }
 
 /// One sidebar's persisted state: shown/hidden, width, and its ordered dock ids.
@@ -330,6 +346,7 @@ impl SidebarsConfig {
         SidebarsConfig {
             left: SideConfig::left_default(),
             right: SideConfig::right_default(),
+            files_side: None,
         }
     }
     /// Migrate a pre-DOCK config: the default layout at the stored width.
@@ -340,16 +357,33 @@ impl SidebarsConfig {
     }
 }
 
-/// Sound alerts. The retro chime is optional, so both default to **off** —
-/// nothing rings until the user turns it on in Settings → General.
-#[derive(Serialize, Deserialize, Clone, Default)]
+/// Sound alerts. Both events default to **off**, while the existing Retro
+/// completion cue remains the default style for backward compatibility.
+#[derive(Serialize, Deserialize, Clone)]
 pub struct NotifyConfig {
-    /// Play the retro chime when an agent finishes a working stretch.
+    /// The synthesized cue family used by both notification events.
+    #[serde(default = "default_sound_style")]
+    pub sound_style: String,
+    /// Play the selected completion cue when an agent finishes a working stretch.
     #[serde(default)]
     pub sound_on_done: bool,
-    /// Play the same chime when an agent blocks on a permission prompt.
+    /// Play the selected attention cue when an agent blocks on a prompt.
     #[serde(default)]
     pub sound_on_blocked: bool,
+}
+
+impl Default for NotifyConfig {
+    fn default() -> Self {
+        Self {
+            sound_style: default_sound_style(),
+            sound_on_done: false,
+            sound_on_blocked: false,
+        }
+    }
+}
+
+fn default_sound_style() -> String {
+    crate::sound::STYLE_RETRO.to_string()
 }
 
 fn default_theme() -> String {
@@ -365,6 +399,13 @@ fn default_shell_choice() -> String {
 pub const FILE_OPEN_READONLY: &str = "readonly";
 fn default_file_open() -> String {
     FILE_OPEN_READONLY.to_string()
+}
+/// `layout.file_click`: reuse one preview pane for a plain click.
+pub const FILE_CLICK_PREVIEW: &str = "preview";
+/// `layout.file_click`: a plain click opens a whole tab, honoring `file_open`.
+pub const FILE_CLICK_TAB: &str = "tab";
+fn default_file_click() -> String {
+    FILE_CLICK_PREVIEW.to_string()
 }
 fn default_sidebar_width() -> u16 {
     SIDEBAR_WIDTH_DEFAULT
@@ -416,6 +457,7 @@ impl Default for LayoutConfig {
             resume_in_new_workspace: true,
             new_pane_to_workspace_root: false,
             file_open: default_file_open(),
+            file_click: default_file_click(),
             scrollback_bytes: Some(SCROLLBACK_BYTES_DEFAULT),
             scrollback: default_scrollback(),
             files_show_hidden: true,
@@ -601,6 +643,12 @@ mod tests {
         // An old config written before this field still loads, at the new default.
         let old: Config = serde_json::from_str(r#"{"layout":{"col_gap":1}}"#).unwrap();
         assert_eq!(old.scrollback_bytes(), SCROLLBACK_BYTES_DEFAULT);
+        // Likewise a config written before `file_click`: an existing user gets
+        // the new preview default without their `file_open` choice moving.
+        assert_eq!(old.layout.file_click, FILE_CLICK_PREVIEW);
+        assert_eq!(c.layout.file_click, FILE_CLICK_PREVIEW);
+        let picked: Config = serde_json::from_str(r#"{"layout":{"file_click":"tab"}}"#).unwrap();
+        assert_eq!(picked.layout.file_click, FILE_CLICK_TAB);
         let old_custom: Config = serde_json::from_str(r#"{"layout":{"scrollback":5000}}"#).unwrap();
         assert_eq!(old_custom.scrollback_bytes(), SCROLLBACK_BYTES_DEFAULT);
         let legacy_mobile: Config =
@@ -613,6 +661,7 @@ mod tests {
         // Sounds are optional and must default to off.
         assert!(!c.notifications.sound_on_done);
         assert!(!c.notifications.sound_on_blocked);
+        assert_eq!(c.notifications.sound_style, crate::sound::STYLE_RETRO);
         let c2 = Config {
             theme: "mono".into(),
             notifications: NotifyConfig {
@@ -626,6 +675,14 @@ mod tests {
         assert_eq!(back.theme, "mono");
         assert!(back.notifications.sound_on_done);
         assert!(!back.notifications.sound_on_blocked);
+        assert_eq!(back.notifications.sound_style, crate::sound::STYLE_RETRO);
+
+        // Configs written before sound styles existed retain the original cue.
+        let old: Config = serde_json::from_str(
+            r#"{"notifications":{"sound_on_done":true,"sound_on_blocked":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(old.notifications.sound_style, crate::sound::STYLE_RETRO);
     }
 
     #[test]

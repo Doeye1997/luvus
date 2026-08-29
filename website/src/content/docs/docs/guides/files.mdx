@@ -12,7 +12,8 @@ in a real editor.
 
 Press **`Ctrl+Space e`** to show or hide it, or place it from
 **Settings → Layout** like any other dock. It follows the active workspace, so
-switching projects re-roots the tree.
+switching projects re-roots the tree. Showing it again restores the last side
+you placed it on.
 
 The global fuzzy finder can search every eligible file name and relative path
 in the workspace even when its folder has never been expanded here. Press
@@ -30,20 +31,54 @@ conflicted, mint for renamed, with a letter badge and a mark on any folder that
 contains changes. Files created outside luvus, by an agent or a command in a
 pane, show up on their own within a couple of seconds.
 
-**Right-click a row** for New File, New Folder, Rename, Copy Path, and Delete
-(Delete always asks first).
+**Right-click a row** for New File, New Folder, Rename, Copy Path, Insert Path,
+and Delete (Delete always asks first).
+
+**Insert Path** types the selected file or folder's absolute path into the pane
+you were already working in, without submitting it — so you can name a file in a command or an
+agent prompt without leaving the keyboard to type the path out. Opening the
+FILES dock and its menu does not move focus, so the path lands where you were
+typing. It is inserted only; Luvus never sends Enter, and never adds an `@` or
+any other prefix, so the syntax stays yours. A path is left uninserted if there
+is no focused live terminal pane (for example, when a read-only file view is
+focused), if the absolute path contains a control character such as a line
+break, tab, or Escape — which would submit or alter your terminal input — or if
+it is not valid UTF-8, since the text Luvus could insert would not be the path
+you clicked.
 
 ## Opening a file
 
 | Gesture | What happens |
 |---|---|
-| **Click** | opens using your default (see below) |
-| **Shift+click** | always opens the **read-only viewer** in a pane beside the focus |
-| **Right-click** | pick per file: read-only, or any editor you have installed |
+| **Click** | **previews** the file by default, or opens a tab — see [What a click does](#what-a-click-does) |
+| **Shift+click** | when forwarded by the terminal, opens the **read-only viewer** in a *permanent* pane beside the focus |
+| **Right-click** | **Open in Tab**, or open in any editor you have installed |
 
-Shift+click is the fixed "just let me look at this" gesture. It stays read-only
-no matter what you set as the default, which is what you want when you are
-reading a file next to a running agent.
+Shift+click is an optional "keep this one open" shortcut. It stays read-only
+whatever the two settings below say, and unlike a preview it is never reused for
+the next file you click. Some terminals reserve Shift-modified mouse input for
+native text selection, so the gesture may not reach Luvus; use **Open in Tab**
+from the right-click menu when you need a permanent view.
+
+## What a click does
+
+**Settings → General → "File click behavior"** has two choices:
+
+| Choice | What a plain click does |
+|---|---|
+| **Preview** (default) | reuses **one** read-only preview pane in the workspace |
+| **Open in tab** | gives the file a whole tab, using **Open files with** |
+
+Preview is the browsing gesture. Click `a.rs` and the preview shows `a.rs`;
+click `b.rs` and the *same* pane shows `b.rs`; click `a.rs` again and it comes
+back. Reading through twenty files leaves you with one pane, not twenty tabs.
+A preview click always uses Luvus's own read-only viewer — it never starts,
+replaces, or quits an editor, so an agent working next door is never disturbed.
+
+Choose **Open in tab** for the behavior clicks had before this setting existed:
+every plain click opens a tab and follows your **Open files with** choice, which
+means it can launch your terminal editor. Clicking a file that already has a tab
+focuses that tab.
 
 ## The read-only viewer
 
@@ -76,10 +111,11 @@ An editor opens in a **new tab** at full width, running as a real terminal
 program. The tab is titled after the editor, and when you quit the editor the
 tab closes itself.
 
-To set what a plain click does, go to **Settings → General → "Open files with"**
-and step through the choices with `‹ ›`: **read-only** (the default) or any
-detected editor. To override it for one file, right-click that file and pick
-from the menu.
+To set which viewer opens a file, go to **Settings → General → "Open files
+with"** and step through the choices with `‹ ›`: **read-only** (the default) or
+any detected editor. That choice applies when a click opens a **tab** — in
+Preview mode a click always uses the built-in viewer. To override it for one
+file, right-click that file and pick from the menu.
 
 If you set an editor and later uninstall it, luvus falls back to the read-only
 viewer rather than doing nothing.

@@ -17,6 +17,18 @@ use crate::layout::{Axis, TileLayout};
 
 const RECENT_FILE_CAP: usize = 12;
 
+/// Existing native views of one file in the active workspace, split by whether
+/// a later click can recycle them. Both can be set at once: opening a tab for a
+/// file the preview is showing deliberately leaves the preview alone.
+#[derive(Default)]
+struct OpenViews {
+    /// A view no click will recycle: a tab, or a split promoted out of the
+    /// preview.
+    permanent: Option<PaneId>,
+    /// The workspace's reusable preview, when it happens to show the file.
+    preview: Option<PaneId>,
+}
+
 /// Where a file opens.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum OpenTarget {
@@ -26,6 +38,25 @@ pub enum OpenTarget {
     Pane,
     /// A whole new tab.
     Tab,
+}
+
+/// What an `Insert Path` did.
+///
+/// The outcome is returned rather than only toasted so a caller — and the tests
+/// for it — can see the exact text that reached the pane and which pane took
+/// it, without reaching into the PTY.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum InsertPath {
+    /// The path was handed to `target`'s paste path, as exactly this text.
+    Inserted { target: PaneId, text: String },
+    /// Nothing to insert into: the focused leaf is a native view, or the tab
+    /// has no pane at all.
+    NoPane,
+    /// The path holds a terminal control character and cannot be pasted safely.
+    ControlCharacter,
+    /// The path is not valid UTF-8, so the text that would reach the pane is not
+    /// the path that was clicked.
+    NotUtf8,
 }
 
 impl App {
@@ -214,15 +245,17 @@ impl App {
         }
     }
 
-    /// `Ctrl+Space e`: mount the FILES dock on the left sidebar, or unmount it if
-    /// it is already shown. Mounting also makes sure the sidebar is visible.
+    /// `Ctrl+Space e`: unmount the FILES dock, or restore it to the side where
+    /// the user last placed it. Mounting also makes sure that side is visible.
     pub fn toggle_files_dock(&mut self) {
         if self.sidebars.side_of(&DockKind::Files).is_some() {
             self.unmount_dock(&DockKind::Files);
         } else {
-            self.sidebars.left.docks.push(DockKind::Files);
-            self.sidebars.left.visible = true;
-            self.save_sidebars();
+            let target = self.sidebars.files_side;
+            if self.sidebars.has_room(target) {
+                self.sidebars.get_mut(target).visible = true;
+            }
+            self.move_dock(&DockKind::Files, target);
         }
     }
 
@@ -237,8 +270,22 @@ impl App {
         crate::config::save(&self.config);
     }
 
-    /// A FILES row was clicked: expand/collapse a folder, or open a file in a
-    /// **preview** pane (VS Code style — one reused pane while browsing).
+    /// What a plain left click on a FILES row does, from `layout.file_click`
+    /// (docs/38). `Preview` is the default: one reused native read-only pane,
+    /// VS Code style. `Tab` is what a click did before this setting existed
+    /// and the *only* mode that consults `layout.file_open`, so it is also the
+    /// only mode that can launch an editor PTY. An unrecognized value — a config
+    /// touched by a newer Luvus — reads back as the default rather than leaving
+    /// a click doing nothing.
+    pub fn file_click_target(&self) -> OpenTarget {
+        match self.config.layout.file_click.trim() {
+            crate::config::FILE_CLICK_TAB => OpenTarget::Tab,
+            _ => OpenTarget::Preview,
+        }
+    }
+
+    /// A FILES row was clicked: expand/collapse a folder, or open a file at
+    /// `target` — the click behavior for a plain click, `Pane` for Shift+click.
     pub fn file_row_activate(&mut self, index: usize, target: OpenTarget) {
         let Some(row) = self.file_tree.visible_rows().get(index).cloned() else {
             return;
@@ -250,17 +297,20 @@ impl App {
             // re-root/refresh, not a user click).
             self.load_pending_dirs();
         } else if target == OpenTarget::Tab {
-            // A plain click honors the configured default (read-only or an editor).
+            // "Open in tab" honors the configured viewer (read-only or an editor).
             self.open_file_at(row.path, None);
         } else {
-            // Shift+click (Pane) / preview always opens the native read-only view.
+            // Shift+click (Pane) and Preview stay inside Luvus: the native
+            // read-only view, never an external editor process.
             self.open_file_view(row.path, target);
         }
     }
 
-    /// Open `path` in a new tab the way a plain FILES click does (docs/38): the
-    /// configured default, read-only viewer or a terminal editor. Shared by the
-    /// FILES tree and by `Ctrl`+clicking a path printed in a pane (docs/58).
+    /// Open `path` in a new **tab** (docs/38), through the configured viewer:
+    /// read-only or a terminal editor. This is the "open in tab" click
+    /// behavior, the fuzzy finder's action, and what `Ctrl`+clicking a path
+    /// printed in a pane always does (docs/58) — a *preview* click never comes
+    /// through here, which is why it can never reach an editor.
     ///
     /// `line` scrolls the built-in viewer to that line. It survives the async read
     /// because `FileView::apply` keeps `scroll` and clamps it to the file's length.
@@ -272,7 +322,9 @@ impl App {
             None => {
                 self.open_file_view(path.clone(), OpenTarget::Tab);
                 if let Some(l) = line {
-                    if let Some(id) = self.view_showing(&path) {
+                    // The tab, never a preview that happens to show the same
+                    // file: `Tab` always lands on the permanent view.
+                    if let Some(id) = self.views_showing(&path).permanent {
                         if let Some(crate::app::ViewKind::File(v)) = self.views.get_mut(&id) {
                             v.scroll = l.saturating_sub(1) as usize;
                         }
@@ -301,8 +353,8 @@ impl App {
 
     /// The configured default open action (docs/38), resolved to an editor
     /// run-command — or `None` for the read-only viewer. A configured editor
-    /// that is no longer installed degrades to read-only, so a plain click never
-    /// silently does nothing.
+    /// that is no longer installed degrades to read-only, so opening a file
+    /// never silently does nothing. Only consulted on the tab path.
     fn file_open_editor(&self) -> Option<String> {
         let choice = self.config.layout.file_open.trim();
         if choice.is_empty() || choice == crate::config::FILE_OPEN_READONLY {
@@ -319,7 +371,19 @@ impl App {
     /// (argv = the editor's words + the file path — a literal argument, so no
     /// shell quoting is involved), so quitting the editor fires `PtyExit` and the
     /// tab closes. The pane's cwd is the file's folder.
+    ///
+    /// Re-opening a file in the editor it is *already* open in focuses that tab
+    /// instead of launching a second one (docs/38): the read-only viewer has
+    /// always de-duplicated this way, and a second `vim` on one file would only
+    /// fight the first over its swap file. A **different** editor is not a
+    /// duplicate — `Open With` is an explicit per-file override — so it opens its
+    /// own tab.
     pub fn open_file_in_editor(&mut self, path: PathBuf, editor: &str) {
+        if let Some(id) = self.editor_tab_showing(&path, editor) {
+            self.remember_file(&path);
+            self.focus_pane_global(id);
+            return;
+        }
         let cwd = path
             .parent()
             .map(Path::to_path_buf)
@@ -349,7 +413,13 @@ impl App {
                 // like a read-only view tab. An editor pane is an ordinary PTY
                 // pane with no file view behind it, so without this the tab bar
                 // has nothing to derive a name from and falls back to the number.
-                self.editor_files.insert(id, path.clone());
+                self.editor_files.insert(
+                    id,
+                    crate::app::EditorFile {
+                        path: path.clone(),
+                        command: editor.to_string(),
+                    },
+                );
                 self.remember_file(&path);
                 let ws = &mut self.workspaces[self.active_ws];
                 ws.tabs.push(Tab::panes(TileLayout::new(id)));
@@ -480,8 +550,59 @@ impl App {
                 self.pending_clipboard = Some(menu.path.to_string_lossy().into_owned());
                 self.show_toast("copied path");
             }
+            FileMenuItem::InsertPath => {
+                match self.insert_path(&menu.path) {
+                    InsertPath::Inserted { .. } => {}
+                    // Both refusals are silent-looking otherwise: the menu closes
+                    // and nothing appears in the prompt.
+                    InsertPath::NoPane => self.show_toast("no pane to insert into"),
+                    InsertPath::ControlCharacter => {
+                        self.show_toast("path contains a control character")
+                    }
+                    InsertPath::NotUtf8 => self.show_toast("path is not valid UTF-8"),
+                }
+            }
             FileMenuItem::Delete => self.file_delete = Some(menu.path),
             FileMenuItem::Divider => {}
+        }
+    }
+
+    /// Type `path` into the focused pane's prompt, leaving it unsubmitted.
+    ///
+    /// The path is absolute, exactly as `Copy Path` gives it, so it stays right
+    /// even when the pane has since changed its working directory. It arrives
+    /// through [`App::paste_into_focused_pane`] rather than a write at the pane,
+    /// which is what keeps bracketed paste, scroll position and activity
+    /// tracking the same as any other paste — and no `\r` follows it, because
+    /// composing the rest of the command line is the user's job.
+    ///
+    /// The target is whatever the active tab already had focused: opening the
+    /// FILES dock and its context menu never moves pane focus, so the pane the
+    /// user was typing in is still the one that receives this.
+    ///
+    /// A path holding a control character is refused rather than trimmed.
+    /// Besides `\n` and `\r` submitting a prompt, Escape and other controls can
+    /// alter terminal input or terminate bracketed-paste mode. These characters
+    /// are legal in Unix filenames, but no truncation of the path is a better
+    /// answer than inserting unsafe or incorrect text.
+    ///
+    /// A path that is not valid UTF-8 is refused for the same reason. Unix
+    /// paths are bytes, not text, so `to_string_lossy` would replace the
+    /// invalid ones with U+FFFD and hand the pane a path that reads plausibly
+    /// and does not exist — a wrong path is worse than no path.
+    pub(crate) fn insert_path(&mut self, path: &Path) -> InsertPath {
+        let Some(text) = path.to_str() else {
+            return InsertPath::NotUtf8;
+        };
+        if text.chars().any(char::is_control) {
+            return InsertPath::ControlCharacter;
+        }
+        match self.paste_into_focused_pane(text) {
+            Some(target) => InsertPath::Inserted {
+                target,
+                text: text.to_owned(),
+            },
+            None => InsertPath::NoPane,
         }
     }
 
@@ -594,15 +715,24 @@ impl App {
         self.refresh_git_status();
     }
 
-    /// The leaf id of an open view already showing `path`, if any.
-    fn view_showing(&self, path: &std::path::Path) -> Option<PaneId> {
-        self.ws()
-            .tabs
-            .iter()
-            .flat_map(|tab| tab.layout.leaves())
-            .find(
-                |id| matches!(self.views.get(id), Some(ViewKind::File(view)) if view.path == path),
-            )
+    /// Where `path` is already open in the active workspace, told apart by
+    /// durability. Reuse has to make that distinction: a permanent view is a
+    /// home the user chose, so it answers any later request for the same file,
+    /// while the preview is scratch space the next click recycles and so only
+    /// answers a request for what it already is.
+    fn views_showing(&self, path: &std::path::Path) -> OpenViews {
+        let mut found = OpenViews::default();
+        for id in self.ws().tabs.iter().flat_map(|tab| tab.layout.leaves()) {
+            if !matches!(self.views.get(&id), Some(ViewKind::File(view)) if view.path == path) {
+                continue;
+            }
+            if self.preview_views.contains(&id) {
+                found.preview.get_or_insert(id);
+            } else {
+                found.permanent.get_or_insert(id);
+            }
+        }
+        found
     }
 
     /// A native file view that owns its whole tab, excluding preview/split panes.
@@ -617,16 +747,74 @@ impl App {
         })
     }
 
+    /// A tab whose whole content is `editor` already running on `path` — the
+    /// terminal-editor twin of `file_tab_showing`. An editor tab has no `views`
+    /// entry to match against (it is an ordinary PTY pane), so `editor_files` is
+    /// the only record of what a tab is editing. That map is cleared by
+    /// `drop_leaf_runtime`, so a quit editor stops matching here and the next
+    /// click gets a fresh one rather than focus into a dead pane.
+    ///
+    /// The command comparison is exact, not normalized: every caller passes a
+    /// run-command taken straight out of `self.editors` (the default resolved by
+    /// `file_open_editor`, or the one `Open With` snapshotted from the same
+    /// list), so both sides are the same canonical string.
+    fn editor_tab_showing(&self, path: &std::path::Path, editor: &str) -> Option<PaneId> {
+        self.ws().tabs.iter().find_map(|tab| {
+            let leaves = tab.layout.leaves();
+            let [id] = leaves.as_slice() else {
+                return None;
+            };
+            self.editor_files
+                .get(id)
+                .is_some_and(|open| open.path == path && open.command == editor)
+                .then_some(*id)
+        })
+    }
+
     /// Open `path` in a native file view (docs/38 FILE-3). `Preview` reuses the
     /// one preview pane in the active workspace; `Pane` splits a fresh permanent
     /// pane; `Tab` opens a new tab. The file is read on a worker thread and
-    /// applied via `FileRead`.
+    /// applied via `FileRead`. No target ever spawns a process — an external
+    /// editor only ever comes from `open_file_at`.
     pub fn open_file_view(&mut self, path: PathBuf, target: OpenTarget) {
         self.remember_file(&path);
-        // Already open? Focus that view instead of opening a duplicate.
-        if let Some(id) = self.view_showing(&path) {
+        let open = self.views_showing(&path);
+        // A permanent view answers every request: the file already has a home
+        // the user chose, and a second copy of one file helps nobody.
+        if let Some(id) = open.permanent {
             self.focus_pane_global(id);
             return;
+        }
+        // The preview showing this file is a weaker match — it answers only the
+        // request that asks for what it already is. Reusing it for the others is
+        // what made "make this one stick" gestures silently do nothing.
+        if let Some(id) = open.preview {
+            match target {
+                // The file is already on screen: this is what keeps a second
+                // click on the same row a no-op.
+                OpenTarget::Preview => {
+                    self.focus_pane_global(id);
+                    return;
+                }
+                // Shift+click on the previewed file means "keep this one". The
+                // preview *is* a pane, so promote it where it stands instead of
+                // opening a second pane on the same file — dropping it from
+                // `preview_views` is the whole of becoming permanent, and the
+                // next preview click then starts a fresh one. (A preview that
+                // was redirected to its own tab, from a dashboard, promotes to
+                // a permanent tab. Placement is not what the user asked to
+                // change; durability is.)
+                OpenTarget::Pane => {
+                    self.preview_views.remove(&id);
+                    self.focus_pane_global(id);
+                    return;
+                }
+                // A tab is a different placement, not a state the preview can
+                // be talked into, so open one. The preview is left alone rather
+                // than closed: it is a pane the user did not ask to lose, and
+                // the next click recycles it anyway.
+                OpenTarget::Tab => {}
+            }
         }
         // Reuse the live preview pane: just swap its content.
         if target == OpenTarget::Preview {
@@ -640,7 +828,22 @@ impl App {
         self.create_file_view(path, target);
     }
 
-    fn create_file_view(&mut self, path: PathBuf, target: OpenTarget) {
+    fn create_file_view(&mut self, path: PathBuf, mut target: OpenTarget) {
+        // Remember what was *asked* for: a preview redirected to its own tab is
+        // still the workspace's preview, so the next click reuses it instead of
+        // stacking a tab per file.
+        let preview = target == OpenTarget::Preview;
+        // A Git/Board/Mission tab is a whole-tab dashboard over an invisible
+        // placeholder leaf: splitting it would wedge a file view into half a
+        // dashboard. The first preview opened from one gets its own tab and
+        // becomes the workspace's preview from then on. Mirrors the same guard
+        // in `open_diff_view`, which now matters for FILES too because Preview
+        // is what a plain click does.
+        if target == OpenTarget::Preview
+            && (self.active_is_git() || self.active_is_orch() || self.active_is_mission())
+        {
+            target = OpenTarget::Tab;
+        }
         let id = PaneId::alloc();
         self.views
             .insert(id, ViewKind::File(FileView::new(path.clone())));
@@ -655,19 +858,31 @@ impl App {
                 self.layout_mut().focus = id;
             }
         }
-        if target == OpenTarget::Preview {
+        if preview {
             self.preview_views.insert(id);
         }
         self.schedule_file_read(id, path);
         self.mode = Mode::Normal;
     }
 
-    /// Point an existing view leaf at a different file and re-read it.
+    /// Point an existing view leaf at a different file and re-read it. The leaf
+    /// is *replaced*, not patched: `preview_views` is shared with DIFF, so the
+    /// reused preview may currently hold a `ViewKind::Diff` (browse a diff, then
+    /// click a file). Matching only `File` there would leave the diff on screen
+    /// and make the click look dead.
     fn set_view_file(&mut self, id: PaneId, path: PathBuf) {
         self.remember_file(&path);
-        if let Some(ViewKind::File(v)) = self.views.get_mut(&id) {
-            *v = FileView::new(path.clone());
-        }
+        // Carry the read token across the replacement. A fresh `FileView`
+        // restarts at 0, and a read still in flight for the file being replaced
+        // would then match the new view by coincidence — which is the very race
+        // the token exists to stop.
+        let previous = match self.views.get(&id) {
+            Some(ViewKind::File(view)) => view.read_token,
+            _ => 0,
+        };
+        let mut view = FileView::new(path.clone());
+        view.read_token = previous;
+        self.views.insert(id, ViewKind::File(view));
         self.schedule_file_read(id, path);
     }
 
@@ -681,20 +896,38 @@ impl App {
     }
 
     fn schedule_file_read(&mut self, id: PaneId, path: PathBuf) {
-        // Record the mtime now so live refresh (FILE-5) only re-reads on a real
-        // change, not immediately after this read.
-        if let Some(ViewKind::File(v)) = self.views.get_mut(&id) {
-            v.mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-        }
+        // Claim the next token for this view and record the mtime now, so live
+        // refresh (FILE-5) only re-reads on a real change rather than
+        // immediately after this read. No view means nothing could apply the
+        // result, so there is nothing worth spawning a thread for.
+        let Some(ViewKind::File(v)) = self.views.get_mut(&id) else {
+            return;
+        };
+        v.read_token = v.read_token.wrapping_add(1);
+        v.mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        let token = v.read_token;
         let tx = self.app_tx.clone();
         std::thread::spawn(move || {
             let load = crate::files::read_file(&path);
-            let _ = tx.send(AppEvent::FileRead { id, load });
+            // Both events carry the token they were issued with and the file
+            // they are about. This worker cannot be cancelled, so the handler is
+            // what drops a result the view has moved past.
+            let _ = tx.send(AppEvent::FileRead {
+                id,
+                path: path.clone(),
+                token,
+                load,
+            });
             // Change markers ride the same worker, *after* the text: the file
             // must render immediately even in a huge repo where `git diff` is
             // slow, and markers simply appear a moment later.
             let changes = crate::git::local::file_changes(&path);
-            let _ = tx.send(AppEvent::FileChanges { id, changes });
+            let _ = tx.send(AppEvent::FileChanges {
+                id,
+                path,
+                token,
+                changes,
+            });
         });
     }
 
@@ -794,8 +1027,42 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{DockKind, FileMenu, FileMenuItem};
+    use crate::app::{DockKind, FileMenu, FileMenuItem, Side};
     use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn files_toggle_restores_last_side_across_restart() {
+        let _env = crate::persist::test_env("files-toggle-side");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+
+        assert!(app.move_dock(&DockKind::Files, Side::Right));
+        assert_eq!(app.sidebars.side_of(&DockKind::Files), Some(Side::Right));
+        app.toggle_files_dock();
+        assert_eq!(app.sidebars.side_of(&DockKind::Files), None);
+        assert_eq!(
+            app.config
+                .sidebars
+                .as_ref()
+                .and_then(|sidebars| sidebars.files_side),
+            Some(Side::Right),
+            "hiding FILES keeps its last placement in config"
+        );
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut reopened = App::new(80, 24, tx).unwrap();
+        assert_eq!(reopened.sidebars.side_of(&DockKind::Files), None);
+        reopened.toggle_files_dock();
+        assert_eq!(
+            reopened.sidebars.side_of(&DockKind::Files),
+            Some(Side::Right),
+            "showing FILES restores the persisted side"
+        );
+        assert!(
+            reopened.sidebars.right.visible,
+            "showing FILES also reveals its sidebar"
+        );
+    }
 
     #[test]
     fn recent_files_are_deduplicated_newest_first_and_bounded() {
@@ -908,7 +1175,7 @@ mod tests {
         // the pane is tracked in `editor_files`, which is what makes the tab bar
         // render the same `■ name` label instead of the bare tab number.
         assert_eq!(
-            app.editor_files.get(&focus).map(|p| p.as_path()),
+            app.editor_files.get(&focus).map(|open| open.path.as_path()),
             Some(file.as_path()),
             "the editor pane is tracked with its file for the tab label"
         );
@@ -923,6 +1190,238 @@ mod tests {
             !app.editor_files.contains_key(&focus),
             "closing the editor pane untracks its file"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A second click on an already-open file must land in the tab that is
+    /// already showing it, not stack up another one. Read-only half: the click
+    /// path (`open_file_at`) goes through `open_file_view`'s reuse guard.
+    #[test]
+    fn clicking_a_file_twice_reuses_its_readonly_tab() {
+        let _env = crate::persist::test_env("file-click-readonly-dedup");
+        let dir = std::env::temp_dir().join(format!("luvus-cr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("once.txt");
+        std::fs::write(&file, b"hello\n").unwrap();
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        assert_eq!(app.file_open_editor(), None, "read-only is the default");
+        let tabs_before = app.workspaces[app.active_ws].tabs.len();
+
+        app.open_file_at(file.clone(), None);
+        let first = app.layout().focus;
+        assert_eq!(
+            app.workspaces[app.active_ws].tabs.len(),
+            tabs_before + 1,
+            "the first click opens a tab"
+        );
+
+        // Move away first, so "focused" is a real effect of the second click and
+        // not just where we already were.
+        app.workspaces[app.active_ws].active_tab = 0;
+        app.open_file_at(file.clone(), None);
+        assert_eq!(
+            app.workspaces[app.active_ws].tabs.len(),
+            tabs_before + 1,
+            "the second click adds no tab"
+        );
+        assert_eq!(app.layout().focus, first, "it focuses the open view");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The editor half of the same rule: with `Open files with:` set, a second
+    /// click focuses the running editor instead of spawning a rival one on the
+    /// same file. Nothing but `editor_files` records what an editor tab holds.
+    #[test]
+    fn clicking_a_file_twice_reuses_its_editor_tab() {
+        let _env = crate::persist::test_env("file-click-editor-dedup");
+        let dir = std::env::temp_dir().join(format!("luvus-ce-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("edit.txt");
+        std::fs::write(&file, b"hello\n").unwrap();
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        // `cat` stands in for the editor, as elsewhere in these tests: a real
+        // program that takes the file as a literal argv element.
+        app.editors = vec![("cat".to_string(), "cat".to_string())];
+        app.config.layout.file_open = "cat".to_string();
+        let tabs_before = app.workspaces[app.active_ws].tabs.len();
+
+        app.open_file_at(file.clone(), None);
+        let first = app.layout().focus;
+        assert_eq!(
+            app.workspaces[app.active_ws].tabs.len(),
+            tabs_before + 1,
+            "the first click opens an editor tab"
+        );
+        assert!(app.panes.contains_key(&first), "the editor is a PTY pane");
+
+        app.workspaces[app.active_ws].active_tab = 0;
+        app.open_file_at(file.clone(), None);
+        assert_eq!(
+            app.workspaces[app.active_ws].tabs.len(),
+            tabs_before + 1,
+            "the second click adds no tab"
+        );
+        assert_eq!(app.layout().focus, first, "it focuses the running editor");
+        assert_eq!(app.panes.len(), 2, "no second editor process was spawned");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// De-duplication is per path, not "one editor tab at a time": a different
+    /// file still gets its own tab.
+    #[test]
+    fn different_files_get_their_own_editor_tabs() {
+        let _env = crate::persist::test_env("file-editor-two-files");
+        let dir = std::env::temp_dir().join(format!("luvus-c2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let one = dir.join("one.txt");
+        let two = dir.join("two.txt");
+        std::fs::write(&one, b"1\n").unwrap();
+        std::fs::write(&two, b"2\n").unwrap();
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        app.editors = vec![("cat".to_string(), "cat".to_string())];
+        app.config.layout.file_open = "cat".to_string();
+        let tabs_before = app.workspaces[app.active_ws].tabs.len();
+
+        app.open_file_at(one.clone(), None);
+        let first = app.layout().focus;
+        app.open_file_at(two.clone(), None);
+        let second = app.layout().focus;
+
+        assert_ne!(first, second, "the second file got its own pane");
+        assert_eq!(
+            app.workspaces[app.active_ws].tabs.len(),
+            tabs_before + 2,
+            "two files, two editor tabs"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `Open With` is an explicit per-file override, not a duplicate: a file
+    /// already open in one editor must still launch in a *different* one picked
+    /// from the right-click menu. De-duplicating on the path alone swallowed it.
+    #[test]
+    fn open_with_a_different_editor_still_launches_it() {
+        let _env = crate::persist::test_env("file-open-with-other-editor");
+        let dir = std::env::temp_dir().join(format!("luvus-cw-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("both.txt");
+        std::fs::write(&file, b"hello\n").unwrap();
+
+        // `cat` and `head` stand in for two installed editors: real programs that
+        // take the file as a literal argv element, as elsewhere in these tests.
+        let editors = vec![
+            ("cat".to_string(), "cat".to_string()),
+            ("head".to_string(), "head".to_string()),
+        ];
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        app.editors = editors.clone();
+        app.config.layout.file_open = "cat".to_string();
+        let tabs_before = app.workspaces[app.active_ws].tabs.len();
+        let menu = |editors: &[(String, String)]| FileMenu {
+            path: file.clone(),
+            is_dir: false,
+            anchor: (0, 0),
+            items: Vec::new(),
+            editors: editors.to_vec(),
+        };
+
+        // A plain click opens the configured default, `cat`.
+        app.open_file_at(file.clone(), None);
+        let first = app.layout().focus;
+
+        // Right-click the same file and pick the *other* editor.
+        app.file_menu = Some(menu(&editors));
+        app.file_menu_action_pub(FileMenuItem::OpenWith(1));
+        let second = app.layout().focus;
+        assert_ne!(second, first, "the override got a pane of its own");
+        assert_eq!(
+            app.workspaces[app.active_ws].tabs.len(),
+            tabs_before + 2,
+            "two editors on one file means two tabs"
+        );
+        assert_eq!(
+            app.editor_files
+                .get(&second)
+                .map(|open| open.command.as_str()),
+            Some("head"),
+            "the new tab runs the editor the user actually picked"
+        );
+
+        // The same editor is still a duplicate: picking `cat` again focuses it.
+        app.file_menu = Some(menu(&editors));
+        app.file_menu_action_pub(FileMenuItem::OpenWith(0));
+        assert_eq!(
+            app.layout().focus,
+            first,
+            "re-picking the running editor focuses its tab"
+        );
+        assert_eq!(
+            app.workspaces[app.active_ws].tabs.len(),
+            tabs_before + 2,
+            "and opens no third tab"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Quitting the editor must leave nothing behind to focus: `PtyExit` closes
+    /// the pane, which untracks its file, so the next click launches a new
+    /// editor rather than jumping to a tab that no longer exists.
+    #[test]
+    fn a_closed_editor_tab_reopens_on_the_next_click() {
+        use crate::event::AppEvent;
+        let _env = crate::persist::test_env("file-editor-reopen");
+        let dir = std::env::temp_dir().join(format!("luvus-cq-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("quit.txt");
+        std::fs::write(&file, b"hello\n").unwrap();
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        app.editors = vec![("cat".to_string(), "cat".to_string())];
+        app.config.layout.file_open = "cat".to_string();
+        let tabs_before = app.workspaces[app.active_ws].tabs.len();
+
+        app.open_file_at(file.clone(), None);
+        let first = app.layout().focus;
+
+        // The editor quits.
+        app.handle_event(AppEvent::PtyExit(first));
+        assert_eq!(
+            app.workspaces[app.active_ws].tabs.len(),
+            tabs_before,
+            "the editor tab closed with its process"
+        );
+        assert!(
+            !app.editor_files.contains_key(&first),
+            "the dead pane no longer claims the file"
+        );
+
+        app.open_file_at(file.clone(), None);
+        let second = app.layout().focus;
+        assert_ne!(second, first, "a fresh editor pane, not the dead id");
+        assert!(app.panes.contains_key(&second), "the new editor is running");
+        assert_eq!(
+            app.workspaces[app.active_ws].tabs.len(),
+            tabs_before + 1,
+            "the file opened again in a tab of its own"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -948,6 +1447,679 @@ mod tests {
         // Present on PATH → returned as the editor command.
         app.editors = vec![("vim".to_string(), "vim".to_string())];
         assert_eq!(app.file_open_editor().as_deref(), Some("vim"));
+    }
+
+    // ── File click behavior (issue #152) ─────────────────────────────────────
+
+    /// A FILES dock over a real directory holding `names`, tree already read —
+    /// the shape every click test needs before it can click a row.
+    fn click_tree_app(
+        tag: &str,
+        names: &[&str],
+    ) -> (App, std::sync::mpsc::Receiver<AppEvent>, PathBuf) {
+        let root = std::env::temp_dir().join(format!("luvus-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for name in names {
+            std::fs::write(root.join(name), b"body\n").unwrap();
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        app.workspaces[app.active_ws].cwd = root.clone();
+        app.sidebars.left.docks.push(DockKind::Files);
+        app.ensure_file_tree();
+        pump_until_dir_read(&rx, &mut app, &root);
+        (app, rx, root)
+    }
+
+    fn row_index(app: &mut App, name: &str) -> usize {
+        app.file_tree
+            .visible_rows()
+            .iter()
+            .position(|r| r.name == name)
+            .unwrap_or_else(|| panic!("{name} has a visible row"))
+    }
+
+    /// Activate a row the way a plain left click does: resolve the configured
+    /// click behavior first, exactly as the mouse path in `input.rs` does.
+    fn plain_click(app: &mut App, name: &str) {
+        let idx = row_index(app, name);
+        let target = app.file_click_target();
+        app.file_row_activate(idx, target);
+    }
+
+    /// Shift+click, the way the mouse path sends it: always a permanent pane.
+    fn shift_click(app: &mut App, name: &str) {
+        let idx = row_index(app, name);
+        app.file_row_activate(idx, OpenTarget::Pane);
+    }
+
+    // ── same-file transitions out of the preview (PR #164 review) ────────────
+
+    /// Preview A, then Shift+click A. Reuse used to answer this from the
+    /// preview, so "keep this one open" silently did nothing and the next click
+    /// on another file recycled A away. The preview is already a pane, so the
+    /// gesture promotes it in place rather than opening a second pane on A.
+    #[test]
+    fn preview_then_shift_click_promotes_that_pane_instead_of_adding_one() {
+        let _env = crate::persist::test_env("file-transition-promote");
+        let (mut app, _rx, root) = click_tree_app("trpromote", &["a.txt", "b.txt"]);
+        let tabs_before = app.workspaces[app.active_ws].tabs.len();
+
+        plain_click(&mut app, "a.txt");
+        let pane = app.layout().focus;
+        assert!(app.preview_views.contains(&pane), "A is in the preview");
+
+        shift_click(&mut app, "a.txt");
+        assert_eq!(app.layout().focus, pane, "the same pane, not a second one");
+        assert_eq!(app.views.len(), 1, "no duplicate view of A");
+        assert_eq!(
+            app.workspaces[app.active_ws].tabs.len(),
+            tabs_before,
+            "and no extra tab"
+        );
+        assert!(
+            !app.preview_views.contains(&pane),
+            "A is now permanent — this is what was broken"
+        );
+        assert_eq!(shown(&app, pane), root.join("a.txt"));
+
+        // Permanent means the next file cannot recycle it: B needs its own pane.
+        plain_click(&mut app, "b.txt");
+        let b = app.layout().focus;
+        assert_ne!(b, pane, "B did not take over the promoted pane");
+        assert_eq!(shown(&app, pane), root.join("a.txt"), "A survived");
+        assert!(app.preview_views.contains(&b), "B started a fresh preview");
+
+        // And a preview click back on A focuses the promoted pane rather than
+        // dragging A into the new preview: permanent answers every request.
+        plain_click(&mut app, "a.txt");
+        assert_eq!(app.layout().focus, pane, "focused the permanent pane");
+        assert_eq!(shown(&app, b), root.join("b.txt"), "the preview kept B");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Preview A, switch the setting to "open in tab", click A. Reuse used to
+    /// answer this from the preview too, so the mode the user just chose did
+    /// nothing on the file they were looking at.
+    #[test]
+    fn preview_then_a_tab_mode_click_opens_a_tab_for_the_same_file() {
+        let _env = crate::persist::test_env("file-transition-tab");
+        let (mut app, _rx, root) = click_tree_app("trtab", &["a.txt"]);
+        let tabs_before = app.workspaces[app.active_ws].tabs.len();
+
+        plain_click(&mut app, "a.txt");
+        let preview = app.layout().focus;
+        assert!(app.preview_views.contains(&preview));
+
+        app.config.layout.file_click = crate::config::FILE_CLICK_TAB.to_string();
+        plain_click(&mut app, "a.txt");
+
+        let tab_view = app.layout().focus;
+        assert_ne!(tab_view, preview, "the tab is its own leaf");
+        assert_eq!(
+            app.workspaces[app.active_ws].tabs.len(),
+            tabs_before + 1,
+            "a tab was opened — this is what was broken"
+        );
+        assert_eq!(shown(&app, tab_view), root.join("a.txt"));
+        assert!(!app.preview_views.contains(&tab_view), "a tab is permanent");
+        // The preview is left alone: it is a pane the user never asked to lose.
+        assert!(
+            app.preview_views.contains(&preview),
+            "the preview is still the workspace preview"
+        );
+        assert_eq!(shown(&app, preview), root.join("a.txt"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The transition that must NOT change: previewing the file already in the
+    /// preview stays one pane and one read. Target-aware reuse has to keep
+    /// answering this from the preview.
+    #[test]
+    fn preview_then_another_preview_click_stays_one_pane() {
+        let _env = crate::persist::test_env("file-transition-noop");
+        let (mut app, _rx, root) = click_tree_app("trnoop", &["a.txt"]);
+        let tabs_before = app.workspaces[app.active_ws].tabs.len();
+
+        plain_click(&mut app, "a.txt");
+        let preview = app.layout().focus;
+        plain_click(&mut app, "a.txt");
+
+        assert_eq!(app.layout().focus, preview, "the same leaf");
+        assert_eq!(app.views.len(), 1, "still one view");
+        assert_eq!(app.preview_views.len(), 1, "still one preview");
+        assert!(
+            app.preview_views.contains(&preview),
+            "and it is still a preview — a second click must not promote it"
+        );
+        assert_eq!(app.workspaces[app.active_ws].tabs.len(), tabs_before);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A file with a permanent tab is answered by that tab whatever the request
+    /// — including a Preview click, which must not drag the file into the
+    /// preview and leave two copies on screen.
+    #[test]
+    fn a_preview_click_focuses_the_permanent_tab_a_file_already_has() {
+        let _env = crate::persist::test_env("file-transition-existing-tab");
+        let (mut app, _rx, root) = click_tree_app("trexist", &["a.txt", "b.txt"]);
+
+        // Give A a tab, then browse B in the preview so a preview exists and is
+        // pointed somewhere else.
+        app.config.layout.file_click = crate::config::FILE_CLICK_TAB.to_string();
+        plain_click(&mut app, "a.txt");
+        let a_tab_index = app.workspaces[app.active_ws].active_tab;
+        let a_view = app.layout().focus;
+        app.config.layout.file_click = crate::config::FILE_CLICK_PREVIEW.to_string();
+        plain_click(&mut app, "b.txt");
+        let preview = app.layout().focus;
+        assert_ne!(preview, a_view);
+        let tabs_before = app.workspaces[app.active_ws].tabs.len();
+
+        plain_click(&mut app, "a.txt");
+
+        assert_eq!(app.layout().focus, a_view, "focused A's existing tab");
+        assert_eq!(
+            app.workspaces[app.active_ws].active_tab, a_tab_index,
+            "and switched to it"
+        );
+        assert_eq!(
+            app.workspaces[app.active_ws].tabs.len(),
+            tabs_before,
+            "no duplicate tab"
+        );
+        assert_eq!(
+            shown(&app, preview),
+            root.join("b.txt"),
+            "the preview was not repointed at A"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The path a native file-view leaf is currently showing.
+    fn shown(app: &App, id: PaneId) -> PathBuf {
+        match app.views.get(&id) {
+            Some(ViewKind::File(v)) => v.path.clone(),
+            _ => panic!("the focused leaf is not a native file view"),
+        }
+    }
+
+    /// The setting decides where a plain click puts the file, through the real
+    /// mouse path: Preview (the default) reuses a pane inside the current tab,
+    /// "open in tab" gives the file a tab of its own.
+    #[test]
+    fn a_plain_click_follows_the_file_click_behavior_setting() {
+        use crate::event::AppEvent;
+        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let _env = crate::persist::test_env("file-click-routing");
+        let (mut app, _rx, root) = click_tree_app("clickroute", &["a.txt", "b.txt"]);
+
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let click = |app: &mut App, term: &mut Terminal<TestBackend>, name: &str| {
+            term.draw(|f| crate::ui::render(f, app)).unwrap();
+            let (_, rect) = app
+                .file_tree_rects
+                .iter()
+                .find(|(i, _)| app.file_tree.visible_rows()[*i].name == name)
+                .cloned()
+                .unwrap_or_else(|| panic!("{name} has a clickable rect"));
+            app.handle_event(AppEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: rect.x + 3,
+                row: rect.y,
+                modifiers: KeyModifiers::NONE,
+            }));
+        };
+
+        // Default: Preview. The file lands in a reused pane beside the focus,
+        // not in a tab of its own.
+        assert_eq!(
+            app.config.layout.file_click,
+            crate::config::FILE_CLICK_PREVIEW,
+            "preview is the shipped default"
+        );
+        let tabs_before = app.workspaces[app.active_ws].tabs.len();
+        click(&mut app, &mut term, "a.txt");
+        let preview = app.layout().focus;
+        assert_eq!(shown(&app, preview), root.join("a.txt"));
+        assert!(
+            app.preview_views.contains(&preview),
+            "a plain click opened the reusable preview"
+        );
+        assert_eq!(
+            app.workspaces[app.active_ws].tabs.len(),
+            tabs_before,
+            "preview does not add a tab"
+        );
+
+        // Switched to "open in tab": the same gesture opens a whole tab, and
+        // that tab is not the reusable preview.
+        app.config.layout.file_click = crate::config::FILE_CLICK_TAB.to_string();
+        click(&mut app, &mut term, "b.txt");
+        let tab_view = app.layout().focus;
+        assert_eq!(shown(&app, tab_view), root.join("b.txt"));
+        assert_eq!(
+            app.workspaces[app.active_ws].tabs.len(),
+            tabs_before + 1,
+            "open in tab adds a tab"
+        );
+        assert!(
+            !app.preview_views.contains(&tab_view),
+            "a tab is permanent, never the reused preview"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The behavior the issue spells out: A → B → C all land in the *same*
+    /// preview, and clicking A again brings that one preview back to A.
+    #[test]
+    fn preview_reuses_one_pane_across_files_and_back_again() {
+        let _env = crate::persist::test_env("file-click-reuse");
+        let (mut app, _rx, root) = click_tree_app("clickreuse", &["a.txt", "b.txt", "c.txt"]);
+        let tabs_before = app.workspaces[app.active_ws].tabs.len();
+
+        plain_click(&mut app, "a.txt");
+        let preview = app.layout().focus;
+        assert_eq!(shown(&app, preview), root.join("a.txt"));
+
+        for name in ["b.txt", "c.txt", "a.txt"] {
+            plain_click(&mut app, name);
+            assert_eq!(
+                app.layout().focus,
+                preview,
+                "{name} reused the same preview leaf"
+            );
+            assert_eq!(shown(&app, preview), root.join(name), "{name} is on screen");
+            assert_eq!(app.views.len(), 1, "still exactly one native view");
+        }
+        assert_eq!(app.preview_views.len(), 1, "one preview, not one per file");
+        assert_eq!(
+            app.workspaces[app.active_ws].tabs.len(),
+            tabs_before,
+            "browsing three files added no tabs"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Clicking the same row over and over is idempotent in Preview mode: the
+    /// preview is already showing that file, so nothing is created or replaced.
+    #[test]
+    fn repeated_preview_clicks_on_one_file_add_nothing() {
+        let _env = crate::persist::test_env("file-click-repeat");
+        let (mut app, _rx, root) = click_tree_app("clickrepeat", &["a.txt"]);
+        let tabs_before = app.workspaces[app.active_ws].tabs.len();
+        let panes_before = app.panes.len();
+
+        plain_click(&mut app, "a.txt");
+        let preview = app.layout().focus;
+        for _ in 0..3 {
+            plain_click(&mut app, "a.txt");
+        }
+        assert_eq!(app.layout().focus, preview, "the same leaf stays focused");
+        assert_eq!(app.views.len(), 1, "no second view accumulated");
+        assert_eq!(app.preview_views.len(), 1, "no second preview accumulated");
+        assert_eq!(app.workspaces[app.active_ws].tabs.len(), tabs_before);
+        assert_eq!(app.panes.len(), panes_before, "and no PTY was spawned");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// "Open in tab" reuses the tab a file already has instead of stacking a
+    /// second one, and focusing it switches back to that tab.
+    #[test]
+    fn open_in_tab_focuses_the_tab_a_file_already_has() {
+        let _env = crate::persist::test_env("file-click-existing-tab");
+        let (mut app, _rx, root) = click_tree_app("clicktab", &["a.txt", "b.txt"]);
+        app.config.layout.file_click = crate::config::FILE_CLICK_TAB.to_string();
+        let tabs_before = app.workspaces[app.active_ws].tabs.len();
+
+        plain_click(&mut app, "a.txt");
+        let a_tab = app.workspaces[app.active_ws].active_tab;
+        let a_view = app.layout().focus;
+        plain_click(&mut app, "b.txt");
+        assert_ne!(
+            app.workspaces[app.active_ws].active_tab, a_tab,
+            "b got its own tab"
+        );
+        assert_eq!(app.workspaces[app.active_ws].tabs.len(), tabs_before + 2);
+
+        plain_click(&mut app, "a.txt");
+        assert_eq!(
+            app.workspaces[app.active_ws].active_tab, a_tab,
+            "clicking a again returned to its tab"
+        );
+        assert_eq!(app.layout().focus, a_view, "and to its existing view leaf");
+        assert_eq!(
+            app.workspaces[app.active_ws].tabs.len(),
+            tabs_before + 2,
+            "no duplicate tab was opened"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The issue's hard constraint: with an external editor configured, a plain
+    /// click in Preview mode must not launch, replace, terminate, or talk to an
+    /// editor PTY. It opens Luvus's own read-only viewer and nothing else. The
+    /// second half proves the editor really was configured, so the first half
+    /// cannot pass by accident.
+    #[test]
+    fn preview_never_launches_the_configured_editor() {
+        let _env = crate::persist::test_env("file-click-no-editor");
+        let (mut app, _rx, root) = click_tree_app("clicknoed", &["a.txt", "b.txt"]);
+        // `cat` stands in for an editor, exactly as in the editor-open test.
+        app.editors = vec![("cat".to_string(), "cat".to_string())];
+        app.config.layout.file_open = "cat".to_string();
+        let panes_before = app.panes.len();
+
+        plain_click(&mut app, "a.txt");
+        let preview = app.layout().focus;
+        assert_eq!(
+            app.panes.len(),
+            panes_before,
+            "Preview spawned no editor PTY"
+        );
+        assert!(
+            app.editor_files.is_empty(),
+            "and tracked no pane as an editor"
+        );
+        assert!(
+            matches!(app.views.get(&preview), Some(ViewKind::File(_))),
+            "the click opened the native read-only viewer"
+        );
+        assert!(app.preview_views.contains(&preview), "in the one preview");
+
+        // Same file, same session, "open in tab": *now* the editor runs. Without
+        // this the assertions above would also hold for an unconfigured editor.
+        app.config.layout.file_click = crate::config::FILE_CLICK_TAB.to_string();
+        plain_click(&mut app, "b.txt");
+        let editor = app.layout().focus;
+        assert_eq!(
+            app.panes.len(),
+            panes_before + 1,
+            "open in tab honors Open files with and runs the editor"
+        );
+        assert_eq!(
+            app.editor_files
+                .get(&editor)
+                .map(|open| open.path.as_path()),
+            Some(root.join("b.txt").as_path())
+        );
+        app.close_pane(editor);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The FILES context menu keeps one explicit native read-only tab action,
+    /// independent of the configured plain-click behavior.
+    #[test]
+    fn the_files_menu_opens_read_only_in_a_tab() {
+        let _env = crate::persist::test_env("file-menu-read-only-tab");
+        let (mut app, _rx, root) = click_tree_app("menutab", &["a.txt"]);
+
+        for mode in [
+            crate::config::FILE_CLICK_PREVIEW,
+            crate::config::FILE_CLICK_TAB,
+        ] {
+            app.config.layout.file_click = mode.to_string();
+            let idx = row_index(&mut app, "a.txt");
+            app.open_file_menu(idx, 1, 1);
+            let items = app.file_menu.as_ref().expect("menu opened").build_items();
+            assert!(items.first() == Some(&FileMenuItem::OpenReadonly));
+        }
+
+        let tabs_before = app.workspaces[app.active_ws].tabs.len();
+        app.file_menu_action_pub(FileMenuItem::OpenReadonly);
+        let opened = app.layout().focus;
+        assert_eq!(shown(&app, opened), root.join("a.txt"));
+        assert!(matches!(app.views.get(&opened), Some(ViewKind::File(_))));
+        assert!(!app.preview_views.contains(&opened));
+        assert_eq!(app.workspaces[app.active_ws].tabs.len(), tabs_before + 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The current read token of a file-view leaf.
+    fn token_of(app: &App, id: PaneId) -> u64 {
+        match app.views.get(&id) {
+            Some(ViewKind::File(v)) => v.read_token,
+            _ => panic!("the leaf is not a native file view"),
+        }
+    }
+
+    /// Reads are addressed by `PaneId`, a preview leaf gets repointed without
+    /// the read already in flight being cancelled, and the two finish in
+    /// whatever order the disk gives. Browsing A → B can land A's text in a view
+    /// whose header says B.
+    ///
+    /// Driven by handing the handler the events directly, so it pins the race
+    /// rather than racing it. The last arm feeds the *current* token with the
+    /// wrong path — a combination the real API cannot produce, which is exactly
+    /// what the path backstop is for.
+    #[test]
+    fn a_late_read_for_the_previous_file_never_lands_in_the_preview() {
+        use crate::files::FileLoad;
+        use crate::git::local::{ChangeKind, ChangeSpan};
+
+        let _env = crate::persist::test_env("file-stale-read");
+        let (mut app, _rx, root) = click_tree_app("stalerd", &["a.txt", "b.txt"]);
+        let (a, b) = (root.join("a.txt"), root.join("b.txt"));
+
+        // One preview, pointed at A and then at B — the reuse path, so both
+        // reads carry the same PaneId.
+        plain_click(&mut app, "a.txt");
+        let preview = app.layout().focus;
+        let a_token = token_of(&app, preview);
+        plain_click(&mut app, "b.txt");
+        assert_eq!(app.layout().focus, preview, "one reused preview leaf");
+        assert_eq!(shown(&app, preview), b);
+        let b_token = token_of(&app, preview);
+        assert_ne!(a_token, b_token, "the repointed view asked for a new read");
+
+        // B's own read lands: the guard must not reject the result the view is
+        // actually waiting for, or it would pass by dropping everything.
+        let repaint = app.handle_event(AppEvent::FileRead {
+            id: preview,
+            path: b.clone(),
+            token: b_token,
+            load: FileLoad::Text(vec!["B CONTENT".to_string()]),
+        });
+        assert!(repaint, "the matching read repaints");
+        let b_marks = vec![ChangeSpan {
+            start: 1,
+            end: 1,
+            kind: ChangeKind::Modified,
+        }];
+        assert!(app.handle_event(AppEvent::FileChanges {
+            id: preview,
+            path: b.clone(),
+            token: b_token,
+            changes: b_marks.clone(),
+        }));
+
+        // Now A's slow read finishes, addressed to the same leaf.
+        let stale = app.handle_event(AppEvent::FileRead {
+            id: preview,
+            path: a.clone(),
+            token: a_token,
+            load: FileLoad::Text(vec!["A CONTENT".to_string()]),
+        });
+        assert!(!stale, "a stale read is dropped without a repaint");
+        let stale_marks = app.handle_event(AppEvent::FileChanges {
+            id: preview,
+            path: a.clone(),
+            token: a_token,
+            changes: vec![ChangeSpan {
+                start: 7,
+                end: 9,
+                kind: ChangeKind::Added,
+            }],
+        });
+        assert!(!stale_marks, "stale markers are dropped too");
+
+        // The backstop: right token, wrong file. Unreachable while every
+        // scheduler bumps the token, and dropped anyway — so a future one that
+        // forgets cannot paint another file's contents into this view.
+        let mismatched = app.handle_event(AppEvent::FileRead {
+            id: preview,
+            path: a,
+            token: b_token,
+            load: FileLoad::Text(vec!["A CONTENT".to_string()]),
+        });
+        assert!(
+            !mismatched,
+            "a read for another file is dropped on its path"
+        );
+
+        match app.views.get(&preview) {
+            Some(ViewKind::File(v)) => {
+                assert_eq!(v.path, b, "the view still points at B");
+                assert!(
+                    matches!(&v.load, FileLoad::Text(lines) if lines == &["B CONTENT"]),
+                    "and still shows B's text, not A's"
+                );
+                assert_eq!(v.changes, b_marks, "and B's markers, not A's");
+            }
+            _ => panic!("the preview is gone"),
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A → B → **A**: the same file twice, so every event's path matches and
+    /// only the token can tell the first read from the third. The first read
+    /// finishing last would quietly restore contents from before the file
+    /// changed on disk.
+    ///
+    /// Live refresh does not rescue this: `schedule_file_read` stamps the mtime
+    /// when it schedules, so the view already holds the newer one and no re-read
+    /// is triggered. The stale text would simply sit there.
+    #[test]
+    fn an_older_read_of_the_same_file_never_overwrites_a_newer_one() {
+        use crate::files::FileLoad;
+
+        let _env = crate::persist::test_env("file-stale-same-file");
+        let (mut app, _rx, root) = click_tree_app("stalegen", &["a.txt", "b.txt"]);
+        let a = root.join("a.txt");
+
+        // A, then B, then A again — one preview leaf throughout.
+        plain_click(&mut app, "a.txt");
+        let preview = app.layout().focus;
+        let first_a = token_of(&app, preview);
+        plain_click(&mut app, "b.txt");
+        plain_click(&mut app, "a.txt");
+        assert_eq!(app.layout().focus, preview, "one reused preview leaf");
+        assert_eq!(shown(&app, preview), a, "back on A");
+        let second_a = token_of(&app, preview);
+        assert_ne!(
+            first_a, second_a,
+            "returning to A scheduled its own read, rather than reusing the \
+             token of the one still in flight"
+        );
+
+        // The read the view is waiting for lands: A as it is now.
+        assert!(app.handle_event(AppEvent::FileRead {
+            id: preview,
+            path: a.clone(),
+            token: second_a,
+            load: FileLoad::Text(vec!["A AFTER THE EDIT".to_string()]),
+        }));
+
+        // The very first read of A finally finishes, carrying what A said
+        // before. Same leaf, same path — only the token differs.
+        let stale = app.handle_event(AppEvent::FileRead {
+            id: preview,
+            path: a.clone(),
+            token: first_a,
+            load: FileLoad::Text(vec!["A BEFORE THE EDIT".to_string()]),
+        });
+        assert!(!stale, "the superseded read is dropped without a repaint");
+
+        match app.views.get(&preview) {
+            Some(ViewKind::File(v)) => {
+                assert_eq!(v.path, a);
+                assert!(
+                    matches!(&v.load, FileLoad::Text(lines) if lines == &["A AFTER THE EDIT"]),
+                    "the newer read survived: {:?}",
+                    v.load
+                );
+            }
+            _ => panic!("the preview is gone"),
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A Git/Board/Mission tab is a whole-tab dashboard over an invisible
+    /// placeholder leaf. Now that a plain click previews, clicking a file while
+    /// one is active must not wedge the viewer into half a dashboard: the
+    /// preview gets its own tab, and stays the workspace's one preview.
+    #[test]
+    fn previewing_from_a_dashboard_tab_opens_a_tab_and_still_reuses_it() {
+        let _env = crate::persist::test_env("file-click-dashboard");
+        let (mut app, _rx, root) = click_tree_app("clickdash", &["a.txt", "b.txt"]);
+        app.open_git_tab(app.active_ws);
+        assert!(app.active_is_git(), "a dashboard tab is active");
+        let tabs_before = app.workspaces[app.active_ws].tabs.len();
+
+        plain_click(&mut app, "a.txt");
+        let preview = app.layout().focus;
+        assert_eq!(shown(&app, preview), root.join("a.txt"));
+        assert_eq!(
+            app.workspaces[app.active_ws].tabs.len(),
+            tabs_before + 1,
+            "the first preview from a dashboard takes a tab of its own"
+        );
+        assert!(
+            !app.active_is_git(),
+            "and the dashboard was left intact, not split"
+        );
+        assert!(
+            app.preview_views.contains(&preview),
+            "it is still the workspace preview"
+        );
+
+        // Which means the next file reuses it rather than stacking tabs.
+        plain_click(&mut app, "b.txt");
+        assert_eq!(app.layout().focus, preview, "reused the same leaf");
+        assert_eq!(shown(&app, preview), root.join("b.txt"));
+        assert_eq!(app.workspaces[app.active_ws].tabs.len(), tabs_before + 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A config written before `layout.file_click` existed still loads, and an
+    /// unrecognized value (a config touched by a newer Luvus) reads as the
+    /// default instead of leaving a click doing nothing.
+    #[test]
+    fn missing_or_unknown_file_click_reads_as_preview() {
+        let _env = crate::persist::test_env("file-click-migrate");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+
+        let old: crate::config::Config =
+            serde_json::from_str(r#"{"layout":{"file_open":"vim"}}"#).unwrap();
+        assert_eq!(
+            old.layout.file_click,
+            crate::config::FILE_CLICK_PREVIEW,
+            "an older config gains the new default"
+        );
+        assert_eq!(old.layout.file_open, "vim", "without losing its own choice");
+
+        app.config.layout.file_click = "somethingelse".to_string();
+        assert!(
+            app.file_click_target() == OpenTarget::Preview,
+            "an unknown value degrades to the default"
+        );
+        app.config.layout.file_click = crate::config::FILE_CLICK_TAB.to_string();
+        assert!(app.file_click_target() == OpenTarget::Tab);
     }
 
     fn buffer_text(term: &Terminal<TestBackend>) -> String {
@@ -1672,6 +2844,8 @@ mod tests {
     /// End-to-end through the real mouse path: click a file row to open it, close
     /// its tab, then click the row again — it must reopen. Reproduces the reported
     /// "won't open the second time" via `handle_event(Mouse)`, not direct calls.
+    /// Pinned to "open in tab", because that is the mode this bug lives in: a
+    /// preview never gets a tab of its own to close.
     #[test]
     fn clicking_a_file_reopens_after_its_tab_is_closed() {
         use crate::event::AppEvent;
@@ -1684,6 +2858,7 @@ mod tests {
 
         let (tx, rx) = std::sync::mpsc::channel();
         let mut app = App::new(120, 40, tx).unwrap();
+        app.config.layout.file_click = crate::config::FILE_CLICK_TAB.to_string();
         app.workspaces[app.active_ws].cwd = root.clone();
         app.sidebars.left.docks.push(DockKind::Files);
         app.ensure_file_tree();
@@ -1966,5 +3141,214 @@ mod tests {
         assert!(!file.exists(), "confirmed delete removes it");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Insert Path (docs/38 FILE-6) ─────────────────────────────────────────
+
+    /// Build a FILES menu for `path` without going through the tree, the way
+    /// the other menu tests here do.
+    fn insert_menu(path: &Path) -> FileMenu {
+        FileMenu {
+            path: path.to_path_buf(),
+            is_dir: false,
+            anchor: (0, 0),
+            items: Vec::new(),
+            editors: Vec::new(),
+        }
+    }
+
+    /// `Insert Path` types into the pane the user was already in, and inserts
+    /// the absolute path *verbatim* — spaces intact, and with nothing appended.
+    ///
+    /// The missing trailing `\r` is the point: the path lands in the prompt for
+    /// the user to finish the command around. Anything that submitted it would
+    /// run a half-written command line.
+    #[test]
+    fn insert_path_types_the_path_into_the_focused_pane_without_submitting_it() {
+        let _env = crate::persist::test_env("files-insert-path");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+
+        // Two panes, so "the focused one" is a real choice rather than the only
+        // pane there is.
+        app.split(Axis::Col);
+        assert_eq!(app.layout().len(), 2, "two panes to choose between");
+        let focused = app.layout().focus;
+
+        // A name with spaces: the shell would need it quoted, which is the
+        // user's business — the insert must not mangle or requote it.
+        let path = std::env::temp_dir().join("luvus insert/my notes.md");
+        let expected = path.to_string_lossy().into_owned();
+        assert!(
+            expected.contains(' '),
+            "the fixture is the interesting case"
+        );
+
+        assert_eq!(
+            app.insert_path(&path),
+            InsertPath::Inserted {
+                target: focused,
+                text: expected.clone(),
+            },
+            "the focused pane got the absolute path, spaces and all"
+        );
+    }
+
+    /// Opening the FILES dock and its context menu must not move pane focus, so
+    /// the pane `Insert Path` targets is still the one the user was typing in.
+    ///
+    /// This is the whole reason the action is worth having: reaching for the
+    /// file tree to name a file would otherwise cost you the prompt you were
+    /// naming it for.
+    #[test]
+    fn opening_the_files_menu_does_not_change_the_insert_target() {
+        let _env = crate::persist::test_env("files-insert-target");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        app.split(Axis::Col);
+        let typing_in = app.layout().focus;
+
+        // Everything the user does to reach the action.
+        app.toggle_files_dock();
+        app.file_menu = Some(insert_menu(&std::env::temp_dir().join("target.rs")));
+        assert_eq!(
+            app.layout().focus,
+            typing_in,
+            "the dock and the menu left pane focus where it was"
+        );
+
+        let path = std::env::temp_dir().join("target.rs");
+        assert!(
+            matches!(
+                app.insert_path(&path),
+                InsertPath::Inserted { target, .. } if target == typing_in
+            ),
+            "the path went to the pane that had focus before the menu opened"
+        );
+    }
+
+    /// Unix filenames may legally hold terminal controls. Newlines can submit
+    /// the prompt, while Escape can terminate bracketed paste and make the
+    /// remaining bytes act as input. Refuse the whole path rather than trim it:
+    /// a silently shortened path is a wrong path.
+    #[test]
+    fn insert_path_refuses_terminal_control_characters() {
+        let _env = crate::persist::test_env("files-insert-control");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+
+        for bad in [
+            "two\nlines.txt",
+            "carriage\rreturn.txt",
+            "tab\tname.txt",
+            "escape\u{1b}[201~name.txt",
+            "delete\u{7f}name.txt",
+        ] {
+            let path = std::env::temp_dir().join(bad);
+            assert_eq!(
+                app.insert_path(&path),
+                InsertPath::ControlCharacter,
+                "{bad:?} must not reach the terminal"
+            );
+        }
+
+        // And a path with no control character still inserts, so the guard is
+        // not simply refusing everything.
+        let good = std::env::temp_dir().join("ordinary.txt");
+        assert!(matches!(
+            app.insert_path(&good),
+            InsertPath::Inserted { .. }
+        ));
+    }
+
+    /// A Unix path is bytes, not text. `to_string_lossy` would turn an invalid
+    /// byte into U+FFFD and insert a path that reads plausibly and does not
+    /// exist — the same "a wrong path is worse than no path" argument that
+    /// refuses control characters rather than trimming them.
+    #[cfg(unix)]
+    #[test]
+    fn insert_path_refuses_a_path_that_is_not_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let _env = crate::persist::test_env("files-insert-not-utf8");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+
+        let name = std::ffi::OsStr::from_bytes(b"not\xffutf8.txt");
+        let path = std::env::temp_dir().join(name);
+        assert_eq!(
+            app.insert_path(&path),
+            InsertPath::NotUtf8,
+            "a lossy conversion would have inserted a path that does not exist"
+        );
+    }
+
+    /// A native read-only view is not a terminal: there is no prompt to insert
+    /// into, so the action says so instead of quietly doing nothing.
+    #[test]
+    fn insert_path_reports_a_focused_leaf_that_is_not_a_pane() {
+        let _env = crate::persist::test_env("files-insert-no-pane");
+        let dir = std::env::temp_dir().join(format!("luvus-ip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("readme.md");
+        std::fs::write(&file, b"hello\n").unwrap();
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        // Focus a native file view rather than a terminal.
+        app.open_file_view(file.clone(), OpenTarget::Tab);
+        assert!(
+            app.views.contains_key(&app.layout().focus),
+            "the focused leaf is a native view, not a pane"
+        );
+
+        assert_eq!(
+            app.insert_path(&file),
+            InsertPath::NoPane,
+            "a view has no prompt to insert into"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The menu row runs the action: picking `Insert Path` for a path that has
+    /// to be refused produces the refusal, which nothing else in the menu does.
+    #[test]
+    fn the_insert_path_row_runs_the_action() {
+        let _env = crate::persist::test_env("files-insert-row");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+
+        app.file_menu = Some(insert_menu(&std::env::temp_dir().join("two\nlines.txt")));
+        app.file_menu_action_pub(FileMenuItem::InsertPath);
+        assert_eq!(
+            app.toast.as_ref().map(|(text, _)| text.as_str()),
+            Some("path contains a control character"),
+            "the row reached insert_path and reported its refusal"
+        );
+    }
+
+    /// The row is offered for folders too — a directory path is as useful to
+    /// type as a file's — matching `Copy Path` rather than the open actions.
+    #[test]
+    fn insert_path_is_offered_for_files_and_folders() {
+        for is_dir in [false, true] {
+            let menu = FileMenu {
+                path: PathBuf::from("/tmp/x"),
+                is_dir,
+                anchor: (0, 0),
+                items: Vec::new(),
+                editors: Vec::new(),
+            };
+            let items = menu.build_items();
+            assert!(
+                items.contains(&FileMenuItem::InsertPath),
+                "Insert Path offered (is_dir={is_dir})"
+            );
+            let copy = items.iter().position(|i| *i == FileMenuItem::CopyPath);
+            let insert = items.iter().position(|i| *i == FileMenuItem::InsertPath);
+            assert!(copy < insert, "it sits with Copy Path, just below it");
+        }
     }
 }

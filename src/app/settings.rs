@@ -113,12 +113,14 @@ pub enum LayoutRow {
 }
 
 /// A selectable row in the General tab: the app-wide preferences that are not
-/// about looks or layout. The file-open control comes first, then a
-/// `── Notifications ──` section (same blank-gap + divider treatment as the
-/// Layout tab's Docks section).
+/// about looks or layout. The two file controls come first — which viewer, then
+/// what a click does with it — then a `── Notifications ──` section (same
+/// blank-gap + divider treatment as the Layout tab's Docks section).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GeneralRow {
     FileOpen,
+    /// What a plain click on a FILES row does: preview, or a whole tab.
+    FileClick,
     FilesShowHidden,
     ShiftEnter,
     CheckUpdates,
@@ -129,9 +131,11 @@ pub enum GeneralRow {
     NewPaneToWorkspaceRoot,
     /// Show each agent's live session title in the AGENTS sidebar.
     AgentTitle,
+    SoundStyle,
     SoundDone,
     SoundBlocked,
-    TestSound,
+    TestDoneSound,
+    TestBlockedSound,
 }
 
 /// A selectable row in the Modules tab (docs/13 §3.6): a module, or one of the
@@ -151,23 +155,31 @@ impl App {
     pub fn general_rows(&self) -> Vec<GeneralRow> {
         vec![
             GeneralRow::FileOpen,
+            GeneralRow::FileClick,
             GeneralRow::FilesShowHidden,
             GeneralRow::ShiftEnter,
             GeneralRow::CheckUpdates,
             GeneralRow::ResumeFlags,
             GeneralRow::NewPaneToWorkspaceRoot,
             GeneralRow::AgentTitle,
+            GeneralRow::SoundStyle,
             GeneralRow::SoundDone,
             GeneralRow::SoundBlocked,
-            GeneralRow::TestSound,
+            GeneralRow::TestDoneSound,
+            GeneralRow::TestBlockedSound,
         ]
     }
 
     /// Index of the first notification row (where the `── Notify ──` divider
-    /// goes), mirroring `dock_section_start` in the Layout tab. The six general
-    /// settings sit above it.
+    /// goes), mirroring `dock_section_start` in the Layout tab.
+    ///
+    /// This is one short: `AgentTitle` is a general setting, so the divider
+    /// renders above it and it reads as a notification option. That off-by-one
+    /// predates the `File click behavior` row — the constant went 6 → 7 only to
+    /// keep the divider where it already was. Fixing it properly means 8, which
+    /// moves a row users have already learned, so it is left for its own change.
     pub fn general_section_start(&self) -> usize {
-        6
+        7
     }
 
     /// The Layout tab's ordered selectable rows (docs/29). The first index of the
@@ -445,10 +457,16 @@ impl App {
                         | Some(LayoutRow::Dock(_))
                         | Some(LayoutRow::Bar(_))
                 ),
-                // The file-open chooser only moves via its `‹ ›` arrows.
-                Some(SettingsTab::General) => {
-                    self.general_rows().get(i) == Some(&GeneralRow::FileOpen)
-                }
+                // The General-tab choosers only move via their `‹ ›` arrows: a
+                // click on the row body selects it. Missing one here is silent —
+                // the click falls through to `settings_activate`, which steps the
+                // value and persists it, so selecting a row would change it.
+                Some(SettingsTab::General) => matches!(
+                    self.general_rows().get(i),
+                    Some(GeneralRow::FileOpen)
+                        | Some(GeneralRow::FileClick)
+                        | Some(GeneralRow::SoundStyle)
+                ),
                 // Number/enum module settings likewise only move via `‹ ›`.
                 Some(SettingsTab::Modules) => self.module_row_is_slider(i),
                 _ => false,
@@ -553,9 +571,12 @@ impl App {
                 self.apply_language(crate::i18n::LANGS[cursor.min(crate::i18n::LANGS.len() - 1)])
             }
             SettingsTab::Layout => self.activate_layout(cursor),
-            // Enter/click: the Test row rings the chime, everything else steps.
+            // Enter/click: Test rows ring their cue, everything else steps.
             SettingsTab::General => match self.general_rows().get(cursor).copied() {
-                Some(GeneralRow::TestSound) => self.test_sound(),
+                Some(GeneralRow::TestDoneSound) => self.test_sound(crate::sound::SoundCue::Done),
+                Some(GeneralRow::TestBlockedSound) => {
+                    self.test_sound(crate::sound::SoundCue::Blocked)
+                }
                 _ => self.adjust_general(cursor, 1),
             },
             // Enter on a rebindable Keys row starts capturing the next key as its
@@ -1163,6 +1184,32 @@ impl App {
         config::save(&self.config);
     }
 
+    /// Cycle what a plain FILES click does (docs/38): preview ⇄ open in tab.
+    /// Deliberately independent of `cycle_file_open`: this picks *where* a file
+    /// lands, that one picks *which viewer* opens it, and only "open in tab"
+    /// ever consults the viewer choice.
+    fn cycle_file_click(&mut self, delta: i32) {
+        let opts = [config::FILE_CLICK_PREVIEW, config::FILE_CLICK_TAB];
+        let n = opts.len() as i32;
+        let cur = opts
+            .iter()
+            .position(|o| *o == self.config.layout.file_click)
+            .unwrap_or(0) as i32;
+        let next = (((cur + delta) % n + n) % n) as usize;
+        self.config.layout.file_click = opts[next].to_string();
+        config::save(&self.config);
+    }
+
+    /// The current click-behavior choice as a display string. An unrecognized
+    /// stored value reads as the default, exactly as `file_click_target` treats it.
+    pub fn file_click_label(&self) -> String {
+        if self.config.layout.file_click.trim() == config::FILE_CLICK_TAB {
+            self.catalog.settings.click_tab.to_string()
+        } else {
+            self.catalog.settings.click_preview.to_string()
+        }
+    }
+
     /// Cycle the Shift/Alt+Enter sequence through [`config::SHIFT_ENTER_CHOICES`].
     fn cycle_shift_enter(&mut self, delta: i32) {
         let opts = config::SHIFT_ENTER_CHOICES;
@@ -1237,6 +1284,7 @@ impl App {
     fn adjust_general(&mut self, cursor: usize, delta: i32) {
         match self.general_rows().get(cursor).copied() {
             Some(GeneralRow::FileOpen) => self.cycle_file_open(delta),
+            Some(GeneralRow::FileClick) => self.cycle_file_click(delta),
             // Flips config *and* the live tree (docs/38), so it applies at once.
             Some(GeneralRow::FilesShowHidden) => self.toggle_files_hidden(),
             Some(GeneralRow::ShiftEnter) => self.cycle_shift_enter(delta),
@@ -1257,6 +1305,7 @@ impl App {
                 self.config.layout.agent_title = !self.config.layout.agent_title;
                 config::save(&self.config);
             }
+            Some(GeneralRow::SoundStyle) => self.cycle_sound_style(delta),
             Some(GeneralRow::SoundDone) => {
                 self.config.notifications.sound_on_done = !self.config.notifications.sound_on_done;
                 config::save(&self.config);
@@ -1266,17 +1315,47 @@ impl App {
                     !self.config.notifications.sound_on_blocked;
                 config::save(&self.config);
             }
-            // The Test row fires on Enter/click only (see `settings_activate`) —
-            // arrows must not ring it, or holding ‹ › would spam the chime.
-            Some(GeneralRow::TestSound) => {}
+            // Test rows fire on Enter/click only (see `settings_activate`) —
+            // arrows must not ring them, or holding ‹ › would spam cues.
+            Some(GeneralRow::TestDoneSound | GeneralRow::TestBlockedSound) => {}
             None => {}
         }
     }
 
-    /// Play the retro chime once so the user can hear it before turning it on.
-    /// Bypasses both sound toggles — it's an explicit manual test.
-    fn test_sound(&mut self) {
-        self.pending_sound = true;
+    fn cycle_sound_style(&mut self, delta: i32) {
+        let current = crate::sound::SoundStyle::from_config(&self.config.notifications.sound_style);
+        let index = crate::sound::STYLES
+            .iter()
+            .position(|style| *style == current)
+            .unwrap_or(0) as i32;
+        let count = crate::sound::STYLES.len() as i32;
+        let next = ((index + delta) % count + count) % count;
+        self.config.notifications.sound_style = crate::sound::STYLES[next as usize].key().into();
+        config::save(&self.config);
+    }
+
+    pub fn sound_style_label(&self) -> &'static str {
+        crate::sound::SoundStyle::from_config(&self.config.notifications.sound_style).label()
+    }
+
+    /// Play one cue so the user can hear the selected style before enabling it.
+    /// Manual tests bypass both event toggles.
+    fn test_sound(&mut self, cue: crate::sound::SoundCue) {
+        self.queue_sound(cue);
+    }
+
+    /// Queue one sound without allowing a completion cue to hide a more urgent
+    /// blocked cue that arrived in the same event-loop interval.
+    pub(crate) fn queue_sound(&mut self, cue: crate::sound::SoundCue) {
+        if self.pending_sound.is_some_and(|signal| {
+            signal.cue == crate::sound::SoundCue::Blocked && cue == crate::sound::SoundCue::Done
+        }) {
+            return;
+        }
+        self.pending_sound = Some(crate::sound::SoundSignal {
+            cue,
+            style: crate::sound::SoundStyle::from_config(&self.config.notifications.sound_style),
+        });
     }
 
     /// Toggle an agent's integration hook: install if absent, uninstall if present.
@@ -1674,9 +1753,9 @@ mod tests {
         assert!(!old.layout.new_pane_to_workspace_root);
     }
 
-    // The General tab is the file-open chooser plus the Notifications section:
-    // the two sound toggles (persisted) and a Test row that rings the chime
-    // immediately, regardless of the toggles.
+    // The General tab is the two file choosers plus the Notifications section:
+    // the selected sound style, two persisted event toggles, and separate test
+    // rows for the completion and attention cues.
     #[test]
     fn general_tab_toggles_sounds_and_tests_the_chime() {
         let _env = crate::persist::test_env("general-tab");
@@ -1686,10 +1765,19 @@ mod tests {
         if let Some(ui) = app.settings.as_mut() {
             ui.tab = SettingsTab::General;
         }
-        assert_eq!(app.settings_rows(SettingsTab::General), 10);
+        assert_eq!(app.settings_rows(SettingsTab::General), 13);
         let rows = app.general_rows();
         assert_eq!(rows[0], GeneralRow::FileOpen, "file-open leads the tab");
+        assert_eq!(
+            rows[1],
+            GeneralRow::FileClick,
+            "click behavior sits next to the viewer it qualifies"
+        );
 
+        let style = rows
+            .iter()
+            .position(|r| *r == GeneralRow::SoundStyle)
+            .unwrap();
         let done = rows
             .iter()
             .position(|r| *r == GeneralRow::SoundDone)
@@ -1698,28 +1786,56 @@ mod tests {
             .iter()
             .position(|r| *r == GeneralRow::SoundBlocked)
             .unwrap();
-        let test = rows
+        let test_done = rows
             .iter()
-            .position(|r| *r == GeneralRow::TestSound)
+            .position(|r| *r == GeneralRow::TestDoneSound)
+            .unwrap();
+        let test_blocked = rows
+            .iter()
+            .position(|r| *r == GeneralRow::TestBlockedSound)
             .unwrap();
 
+        assert_eq!(app.sound_style_label(), "Retro");
+        app.settings_adjust(style, 1);
+        assert_eq!(app.sound_style_label(), "Soft");
         app.settings_activate(done);
         assert!(app.config.notifications.sound_on_done, "toggles done");
         app.settings_activate(blocked);
         assert!(app.config.notifications.sound_on_blocked, "toggles blocked");
 
-        assert!(!app.pending_sound);
-        // Arrows must NOT ring the chime (only Enter/click does).
-        app.settings_adjust(test, 1);
-        assert!(!app.pending_sound, "‹ › on the Test row does not ring");
-        app.settings_activate(test);
-        assert!(app.pending_sound, "the Test row rings the chime");
+        assert!(app.pending_sound.is_none());
+        // Arrows must NOT ring cues (only Enter/click does).
+        app.settings_adjust(test_done, 1);
+        assert!(
+            app.pending_sound.is_none(),
+            "‹ › on a Test row does not ring"
+        );
+        app.settings_activate(test_done);
+        assert_eq!(
+            app.pending_sound,
+            Some(crate::sound::SoundSignal {
+                cue: crate::sound::SoundCue::Done,
+                style: crate::sound::SoundStyle::Soft,
+            })
+        );
+        app.settings_activate(test_blocked);
+        assert_eq!(
+            app.pending_sound.map(|signal| signal.cue),
+            Some(crate::sound::SoundCue::Blocked),
+            "blocked test replaces a pending done cue"
+        );
+        app.settings_activate(test_done);
+        assert_eq!(
+            app.pending_sound.map(|signal| signal.cue),
+            Some(crate::sound::SoundCue::Blocked),
+            "a done cue cannot hide a pending blocked cue"
+        );
     }
 
-    /// The General tab renders the file-open chooser, then a `Notify` section
+    /// The General tab renders the two file choosers, then a `Notify` section
     /// divider, then the sound rows — the Docks-section treatment (docs/15).
     #[test]
-    fn general_tab_renders_file_open_then_a_notify_section() {
+    fn general_tab_renders_the_file_choosers_then_a_notify_section() {
         use ratatui::{backend::TestBackend, Terminal};
         let _env = crate::persist::test_env("general-render");
         let (tx, _rx) = std::sync::mpsc::channel();
@@ -1744,6 +1860,11 @@ mod tests {
         assert!(all.contains("Open files with"), "file-open row drawn");
         assert!(all.contains("read-only"), "its current value drawn");
         assert!(
+            all.contains("File click behavior"),
+            "the click-behavior row drawn beside it"
+        );
+        assert!(all.contains("Preview"), "its default value drawn");
+        assert!(
             all.contains("Remember CLI option"),
             "the resume switch drawn"
         );
@@ -1755,7 +1876,7 @@ mod tests {
             row_of("Open files with"),
             row_of("Remember CLI option"),
             row_of("Notify"),
-            row_of("Test sound"),
+            row_of("Test blocked sound"),
         );
         assert!(
             fo < res && res < div && div < snd,
@@ -1932,6 +2053,143 @@ mod tests {
         assert_eq!(
             app.config.layout.file_open, "nano",
             "steps backward with wrap"
+        );
+    }
+
+    /// The General tab's "File click behavior" slider is a two-way toggle that
+    /// persists, and it is independent of "Open files with": cycling one must
+    /// never move the other.
+    #[test]
+    fn general_file_click_cycles_between_preview_and_tab() {
+        let _env = crate::persist::test_env("file-click-cycle");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        app.editors = vec![("vim".into(), "vim".into())];
+        app.open_settings();
+        if let Some(ui) = app.settings.as_mut() {
+            ui.tab = SettingsTab::General;
+        }
+        let click = app
+            .general_rows()
+            .iter()
+            .position(|r| *r == GeneralRow::FileClick)
+            .expect("the General tab has a click-behavior row");
+        let open = app
+            .general_rows()
+            .iter()
+            .position(|r| *r == GeneralRow::FileOpen)
+            .expect("the General tab has a file-open row");
+
+        assert_eq!(
+            app.config.layout.file_click,
+            config::FILE_CLICK_PREVIEW,
+            "preview is the default"
+        );
+        assert_eq!(app.file_click_label(), "Preview");
+        app.settings_adjust(click, 1);
+        assert_eq!(app.config.layout.file_click, config::FILE_CLICK_TAB);
+        assert_eq!(app.file_click_label(), "Open in tab");
+        assert_eq!(
+            crate::config::load().layout.file_click,
+            config::FILE_CLICK_TAB,
+            "and the choice was saved"
+        );
+        assert_eq!(
+            app.config.layout.file_open, "readonly",
+            "the viewer choice did not move with it"
+        );
+        // Two values, so a step in either direction wraps straight back.
+        app.settings_adjust(click, -1);
+        assert_eq!(app.config.layout.file_click, config::FILE_CLICK_PREVIEW);
+
+        // And the reverse: stepping the viewer leaves the click behavior alone.
+        app.settings_adjust(open, 1);
+        assert_eq!(app.config.layout.file_open, "vim");
+        assert_eq!(app.config.layout.file_click, config::FILE_CLICK_PREVIEW);
+    }
+
+    /// A click on a `‹ ›` slider's row *body* selects it and nothing more —
+    /// only the arrows step the value. Both General-tab file choosers are
+    /// sliders, and a row missing from `handle_settings_click`'s slider list
+    /// fails silently: the click falls through to `settings_activate`, which
+    /// cycles the setting and writes it to disk. So a user reaching to select
+    /// the row would change their setting instead.
+    #[test]
+    fn clicking_a_file_chooser_row_body_selects_it_without_changing_it() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let _env = crate::persist::test_env("settings-slider-body-click");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(100, 30, tx).unwrap();
+        app.editors = vec![("vim".into(), "vim".into())];
+        app.open_settings();
+        if let Some(ui) = app.settings.as_mut() {
+            ui.tab = SettingsTab::General;
+            // Park the cursor elsewhere so "the cursor moved" is a real signal.
+            ui.cursor = 0;
+        }
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+
+        for row in [GeneralRow::FileClick, GeneralRow::FileOpen] {
+            let i = app
+                .general_rows()
+                .iter()
+                .position(|r| *r == row)
+                .unwrap_or_else(|| panic!("{row:?} is on the General tab"));
+            let rect = app
+                .settings_ctl_rects
+                .iter()
+                .find(|(index, _)| *index == i)
+                .map(|(_, rect)| *rect)
+                .unwrap_or_else(|| panic!("{row:?} has a control rect"));
+            let before = (
+                app.config.layout.file_click.clone(),
+                app.config.layout.file_open.clone(),
+            );
+
+            // The row body: two cells in from the left, far from the right-aligned
+            // `‹ ›` arrows.
+            app.handle_settings_click(rect.x + 2, rect.y);
+
+            assert_eq!(
+                app.settings.as_ref().unwrap().cursor,
+                i,
+                "{row:?} body click moves the cursor to it"
+            );
+            assert_eq!(
+                (
+                    app.config.layout.file_click.clone(),
+                    app.config.layout.file_open.clone()
+                ),
+                before,
+                "{row:?} body click must not step any chooser"
+            );
+            assert_eq!(
+                crate::config::load().layout.file_click,
+                before.0,
+                "{row:?} body click must not persist a change either"
+            );
+            term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        }
+
+        // The arrows still work: `›` on the click-behavior row steps it.
+        let i = app
+            .general_rows()
+            .iter()
+            .position(|r| *r == GeneralRow::FileClick)
+            .expect("the click-behavior row");
+        let (_, _, arrow) = app
+            .settings_arrow_rects
+            .iter()
+            .find(|(index, delta, _)| *index == i && *delta == 1)
+            .copied()
+            .expect("the click-behavior row has a `›` arrow");
+        app.handle_settings_click(arrow.x, arrow.y);
+        assert_eq!(
+            app.config.layout.file_click,
+            config::FILE_CLICK_TAB,
+            "the arrow is what steps the value"
         );
     }
 
