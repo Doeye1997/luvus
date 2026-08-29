@@ -330,6 +330,25 @@ pub fn process_belongs_to_current_user(pid: u32) -> bool {
     windows::process_belongs_to_current_user(pid)
 }
 
+#[cfg(target_os = "macos")]
+fn process_executable(pid: u32) -> Option<PathBuf> {
+    let mut buffer = vec![0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: `buffer` is writable for the size passed to `proc_pidpath`, and
+    // the returned byte count is checked before constructing the path.
+    let len = unsafe {
+        libc::proc_pidpath(
+            pid as libc::c_int,
+            buffer.as_mut_ptr().cast(),
+            buffer.len() as u32,
+        )
+    };
+    if len <= 0 {
+        return None;
+    }
+    buffer.truncate(len as usize);
+    Some(PathBuf::from(String::from_utf8_lossy(&buffer).into_owned()))
+}
+
 /// True when `pid` is another Luvus process owned by this account.
 /// `server stop` uses this before force-killing an unresponsive server.
 pub fn is_stoppable_luvus_pid(pid: u32) -> bool {
@@ -341,12 +360,8 @@ pub fn is_stoppable_luvus_pid(pid: u32) -> bool {
         if !process_belongs_to_current_user(pid) {
             return false;
         }
-        process_tree(pid).first().is_some_and(|info| {
-            let name = info
-                .command
-                .rsplit(['\\', '/'])
-                .next()
-                .unwrap_or(&info.command);
+        windows::process_executable(pid).is_some_and(|executable| {
+            let name = executable.rsplit(['\\', '/']).next().unwrap_or(&executable);
             name.eq_ignore_ascii_case("luvus.exe")
         })
     }
@@ -355,7 +370,15 @@ pub fn is_stoppable_luvus_pid(pid: u32) -> bool {
         std::fs::read_to_string(format!("/proc/{pid}/comm"))
             .is_ok_and(|comm| comm.trim() == "luvus")
     }
-    #[cfg(all(unix, not(target_os = "linux")))]
+    #[cfg(target_os = "macos")]
+    {
+        process_executable(pid).is_some_and(|executable| {
+            executable
+                .file_name()
+                .is_some_and(|name| name == std::ffi::OsStr::new("luvus"))
+        })
+    }
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
     {
         let Some(info) = process_tree(pid).into_iter().next() else {
             return false;
@@ -1009,6 +1032,40 @@ mod tests {
     fn unix_stoppable_pid_rejects_self_and_missing() {
         assert!(!super::is_stoppable_luvus_pid(0));
         assert!(!super::is_stoppable_luvus_pid(std::process::id()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_stoppable_pid_accepts_a_luvus_executable_with_arguments() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("stoppable-pid-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("test executable directory");
+        let executable = dir.join("luvus");
+        let _ = std::fs::remove_file(&executable);
+        std::fs::copy("/bin/sleep", &executable).expect("luvus-named executable");
+        let mut child = std::process::Command::new(&executable)
+            .arg("30")
+            .spawn()
+            .expect("spawn luvus-named process");
+
+        let mut stoppable = false;
+        for _ in 0..20 {
+            if super::is_stoppable_luvus_pid(child.id()) {
+                stoppable = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&executable);
+        let _ = std::fs::remove_dir(&dir);
+        assert!(
+            stoppable,
+            "a live luvus executable must pass the kill guard"
+        );
     }
 
     #[cfg(unix)]
