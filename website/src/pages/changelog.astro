@@ -162,16 +162,17 @@ const splitLead = (body) => {
     : { lead: text.slice(0, boundary), rest: text.slice(boundary).trim() };
 };
 
-// Contributor links remain ordinary Markdown for the terminal app and GitHub.
-// The website extracts the same rows into compact avatar cards without making a
-// build-time API request or duplicating contributor metadata in front matter.
-const extractContributors = (body) => {
+// Contributor and issue-reporter links remain ordinary Markdown for the
+// terminal app and GitHub. The website extracts the same rows into compact
+// avatar cards without making a build-time API request or duplicating profile
+// metadata in front matter.
+const extractPeopleSection = (body, heading) => {
   const lines = body.split(/\r?\n/);
-  const start = lines.findIndex((line) => line.trim() === '## Contributors');
-  if (start === -1) return { body: body.trim(), contributors: [] };
+  const start = lines.findIndex((line) => line.trim() === `## ${heading}`);
+  if (start === -1) return { body: body.trim(), people: [] };
   const nextHeading = lines.slice(start + 1).findIndex((line) => /^##\s+/.test(line.trim()));
   const end = nextHeading === -1 ? lines.length : start + 1 + nextHeading;
-  const contributors = lines.slice(start + 1, end).flatMap((line) => {
+  const people = lines.slice(start + 1, end).flatMap((line) => {
     const match = /^\s*-\s+\[([^\]]+)\]\(https:\/\/github\.com\/([A-Za-z0-9-]+)\/?\)\s*$/.exec(line);
     if (!match) return [];
     const label = match[1].trim();
@@ -191,7 +192,17 @@ const extractContributors = (body) => {
     .join('\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
-  return { body: withoutSection, contributors };
+  return { body: withoutSection, people };
+};
+
+const extractCredits = (body) => {
+  const contributors = extractPeopleSection(body, 'Contributors');
+  const reporters = extractPeopleSection(contributors.body, 'Issue reporters');
+  return {
+    body: reporters.body,
+    contributors: contributors.people,
+    reporters: reporters.people,
+  };
 };
 
 // Newest first, comparing version numbers rather than strings so v0.10.0 sorts
@@ -216,7 +227,7 @@ const entries = await Promise.all(
     const media = (websiteMedia?.media || r.media)
       .map((item) => ({ ...item, url: videos[item.file] || '' }))
       .filter((item) => item.url);
-    const extracted = extractContributors(r.body);
+    const extracted = extractCredits(r.body);
     const { lead, rest } = media.length > 0
       ? splitLead(extracted.body)
       : { lead: '', rest: extracted.body };
@@ -229,6 +240,7 @@ const entries = await Promise.all(
       mediaHeading: websiteMedia?.heading || '',
       mediaIntro: websiteMedia?.intro || '',
       contributors: extracted.contributors,
+      reporters: extracted.reporters,
       leadHtml: lead ? (await md.render(lead)).code : '',
       html: (await md.render(rest || (lead ? '' : '_No release notes._'))).code,
     };
@@ -401,17 +413,20 @@ const entries = await Promise.all(
                     </div>
                   )}
                   <div class="notes" set:html={e.html} />
-                  {e.contributors.length > 0 && (
-                    <div class="release-contributors" aria-labelledby={`contributors-${e.tag}`}>
-                      <h2 id={`contributors-${e.tag}`}>Contributors</h2>
+                  {[
+                    { key: 'contributors', title: 'Contributors', people: e.contributors },
+                    { key: 'issue-reporters', title: 'Issue reporters', people: e.reporters },
+                  ].filter((group) => group.people.length > 0).map((group) => (
+                    <div class="release-contributors" aria-labelledby={`${group.key}-${e.tag}`}>
+                      <h2 id={`${group.key}-${e.tag}`}>{group.title}</h2>
                       <ul>
-                        {e.contributors.map((contributor) => (
+                        {group.people.map((person) => (
                           <li>
-                            <a href={contributor.url} title={`View ${contributor.name} on GitHub`}>
+                            <a href={person.url} title={`View ${person.name} on GitHub`}>
                               <span class="contributor-avatar" aria-hidden="true">
-                                <span>{contributor.initials}</span>
+                                <span>{person.initials}</span>
                                 <img
-                                  src={contributor.avatar}
+                                  src={person.avatar}
                                   alt=""
                                   width="40"
                                   height="40"
@@ -422,15 +437,15 @@ const entries = await Promise.all(
                                 />
                               </span>
                               <span class="contributor-name">
-                                <strong>{contributor.name}</strong>
-                                {contributor.name !== contributor.login && <small>@{contributor.login}</small>}
+                                <strong>{person.name}</strong>
+                                {person.name !== person.login && <small>@{person.login}</small>}
                               </span>
                             </a>
                           </li>
                         ))}
                       </ul>
                     </div>
-                  )}
+                  ))}
                 </article>
               </li>
             ))}

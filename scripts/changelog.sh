@@ -41,11 +41,12 @@ strip_front_matter() {
 }
 
 # GitHub Releases can render profile pictures even though the source Markdown
-# stays portable for the terminal app. Add an avatar row above a curated linked
-# contributor list, then retain the text list as the accessible fallback.
+# stays portable for the terminal app. Add an avatar row above curated linked
+# contributor and issue-reporter lists, then retain each text list as the
+# accessible fallback.
 render_release_notes() {
   strip_front_matter | perl -0pe '
-    s{(^## Contributors[ \t]*\r?\n(?:\r?\n)?)((?:^[ \t]*-[^\r\n]*(?:\r?\n|$))+)}{
+    s{(^## (?:Contributors|Issue reporters)[ \t]*\r?\n(?:\r?\n)?)((?:^[ \t]*-[^\r\n]*(?:\r?\n|$))+)}{
       my ($heading, $list) = ($1, $2);
       my @avatars;
       while ($list =~ m{^[ \t]*- \[([^\]]+)\]\(https://github\.com/([A-Za-z0-9-]+)/?\)[ \t]*$}gm) {
@@ -183,7 +184,7 @@ if [ "$WRITE" = 1 ]; then
   notes > "$FILE"
   printf 'wrote changelog/%s.md — edit it before releasing.\n' "$NEW" >&2
 else
-  # Same rendering as the curated path, including contributor avatars when the
-  # generated notes eventually contain linked GitHub profiles.
+  # Same rendering as the curated path, including profile avatars when the
+  # generated notes eventually contain linked GitHub credit sections.
   notes | render_release_notes
 fi
