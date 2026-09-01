@@ -2789,6 +2789,24 @@ mod tests {
             "the always-on reference is below the fold before scrolling:\n{top}"
         );
 
+        // Workspace defaults are terminal symbols internally, but the Keys UI
+        // describes the physical chords users should press.
+        for position in [1, 9] {
+            let command = crate::app::Cmd::JumpWorkspace(position);
+            let index = crate::app::Cmd::ALL
+                .iter()
+                .position(|candidate| *candidate == command)
+                .unwrap();
+            app.settings.as_mut().unwrap().cursor = crate::app::KEYS_HEADER_ROWS + index;
+            let workspace_jump = screen(&mut app);
+            assert!(
+                workspace_jump.contains(&format!("Jump to workspace {position}"))
+                    && workspace_jump.contains(&format!("Shift+{position}")),
+                "workspace jump shows its chord label:\n{workspace_jump}"
+            );
+        }
+        app.settings.as_mut().unwrap().cursor = 0;
+
         // Midway: the cursor reaches the first reference block (the fixed keys).
         // Step past the two header rows (prefix / preset) and every command.
         for _ in 0..crate::app::KEYS_HEADER_ROWS + crate::app::Cmd::ALL.len() {

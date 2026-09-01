@@ -189,24 +189,28 @@ mod tests {
         app.prefix = crate::app::PrefixSpec::parse("f12").unwrap();
         let mut term = Terminal::new(TestBackend::new(100, 32)).unwrap();
 
-        // The middle of the command column includes the shortcuts that were
-        // easy to miss in the old clipped reference.
-        app.help_scroll = 20;
+        // Discover the real scroll range first, then inspect every reachable
+        // viewport so adding commands cannot make this test depend on a magic
+        // scroll offset.
+        app.help_scroll = u16::MAX;
         term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
-        let rendered = screen(&term);
+        let scroll_max = app.help_scroll_max;
+        assert_eq!(app.help_scroll, scroll_max);
+
+        let mut rendered = String::new();
+        for scroll in 0..=scroll_max {
+            app.help_scroll = scroll;
+            term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+            rendered.push_str(&screen(&term));
+        }
+
         assert!(rendered.contains("F12"), "configured prefix is shown");
         assert!(rendered.contains("Focus diff review"), "prefix+i is listed");
         assert!(rendered.contains("Files: focus"), "prefix+e is listed");
 
         // The final fixed-key section proves the reference is scrollable all
         // the way past command mode, Git, board, picker, and clipboard keys.
-        app.help_scroll = u16::MAX;
-        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
-        assert_eq!(app.help_scroll, app.help_scroll_max);
-        assert!(
-            screen(&term).contains("MOUSE"),
-            "fixed shortcuts are listed"
-        );
+        assert!(rendered.contains("MOUSE"), "fixed shortcuts are listed");
     }
 
     #[test]

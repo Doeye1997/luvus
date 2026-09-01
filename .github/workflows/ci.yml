@@ -118,6 +118,7 @@ jobs:
           cargo test --locked app::backend::tests
           cargo test --locked terminal::backend::tests
           cargo test --locked altgr
+          cargo test --locked prefix_digits_jump_to_tabs_and_shifted_digits_jump_to_workspaces
           cargo test --locked diff::git::tests::tree_tint_uses_nested_visible_spelling_and_new_rename_path
           cargo test --locked agent::tests::claude_project_dir_encodes_every_non_alphanumeric
       - name: Validate published protocol fixtures

@@ -9,6 +9,15 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::*;
 
+/// Legacy terminals using the US number row report Shift+1 through Shift+9 as
+/// these symbols. Keep this transport representation separate from the label
+/// shown to users, which is `Shift+N` for the matching workspace default.
+const SHIFTED_DIGIT_KEYS: [&str; 9] = ["!", "@", "#", "$", "%", "^", "&", "*", "("];
+
+fn workspace_jump_index(position: u8) -> usize {
+    position.saturating_sub(1).min(8) as usize
+}
+
 /// Is this a real `Ctrl` chord, or is it AltGr typing a character?
 ///
 /// The Windows console reports AltGr as `CONTROL | ALT` — the layout driver
@@ -69,6 +78,7 @@ pub enum Cmd {
     CloseWorkspace,
     NextWorkspace,
     PrevWorkspace,
+    JumpWorkspace(u8),
     NewWorktree,
     OpenGit,
     OpenDiff,
@@ -111,6 +121,15 @@ impl Cmd {
         Cmd::CloseWorkspace,
         Cmd::NextWorkspace,
         Cmd::PrevWorkspace,
+        Cmd::JumpWorkspace(1),
+        Cmd::JumpWorkspace(2),
+        Cmd::JumpWorkspace(3),
+        Cmd::JumpWorkspace(4),
+        Cmd::JumpWorkspace(5),
+        Cmd::JumpWorkspace(6),
+        Cmd::JumpWorkspace(7),
+        Cmd::JumpWorkspace(8),
+        Cmd::JumpWorkspace(9),
         Cmd::NewWorktree,
         Cmd::OpenGit,
         Cmd::OpenDiff,
@@ -151,6 +170,17 @@ impl Cmd {
             Cmd::CloseWorkspace => "close_node",
             Cmd::NextWorkspace => "next_node",
             Cmd::PrevWorkspace => "prev_node",
+            Cmd::JumpWorkspace(position) => [
+                "jump_workspace_1",
+                "jump_workspace_2",
+                "jump_workspace_3",
+                "jump_workspace_4",
+                "jump_workspace_5",
+                "jump_workspace_6",
+                "jump_workspace_7",
+                "jump_workspace_8",
+                "jump_workspace_9",
+            ][workspace_jump_index(position)],
             Cmd::NewWorktree => "new_worktree",
             Cmd::OpenGit => "open_git",
             Cmd::OpenDiff => "open_diff",
@@ -194,6 +224,7 @@ impl Cmd {
             Cmd::CloseWorkspace => cat.cmd_close_workspace,
             Cmd::NextWorkspace => cat.cmd_next_workspace,
             Cmd::PrevWorkspace => cat.cmd_prev_workspace,
+            Cmd::JumpWorkspace(position) => cat.cmd_jump_workspace[workspace_jump_index(position)],
             Cmd::NewWorktree => cat.cmd_new_worktree,
             Cmd::OpenGit => cat.cmd_open_git,
             Cmd::OpenDiff => cat.cmd_open_diff,
@@ -235,6 +266,7 @@ impl Cmd {
             | Cmd::CloseWorkspace
             | Cmd::NextWorkspace
             | Cmd::PrevWorkspace
+            | Cmd::JumpWorkspace(_)
             | Cmd::NewWorktree => cat.settings.keys_sections[2],
             Cmd::OpenGit
             | Cmd::OpenDiff
@@ -275,6 +307,7 @@ impl Cmd {
             Cmd::CloseWorkspace => "D",
             Cmd::NextWorkspace => "w",
             Cmd::PrevWorkspace => "W",
+            Cmd::JumpWorkspace(position) => SHIFTED_DIGIT_KEYS[workspace_jump_index(position)],
             Cmd::NewWorktree => "G",
             Cmd::OpenGit => "g",
             Cmd::OpenDiff => "i",
@@ -300,7 +333,10 @@ impl Cmd {
     /// from `build_keymap` — every binding now flows through this list or a user
     /// override, so nothing is bound behind the user's back.
     pub fn default_keys(self) -> Vec<&'static str> {
-        let mut keys = vec![self.default_key()];
+        let mut keys = match self.default_key() {
+            "" => Vec::new(),
+            key => vec![key],
+        };
         let aliases: &[&str] = match self {
             Cmd::FocusLeft => &["h"],
             Cmd::FocusDown => &["j"],
@@ -331,6 +367,9 @@ pub fn key_reference_rows() -> usize {
 /// Used both to match presses and to display/store bindings.
 pub fn key_string(key: &KeyEvent) -> Option<String> {
     Some(match key.code {
+        KeyCode::Char(c @ '1'..='9') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            SHIFTED_DIGIT_KEYS[c as usize - '1' as usize].into()
+        }
         KeyCode::Char(c) => c.to_string(),
         KeyCode::Left => "←".into(),
         KeyCode::Right => "→".into(),
@@ -703,6 +742,11 @@ pub fn presets() -> &'static [Preset] {
                 // `(` / `)` step to the previous / next session (luvus workspace).
                 ("prev_node", "("),
                 ("next_node", ")"),
+                // These workspace defaults use the same legacy terminal symbols
+                // as tmux's split and previous-session keys. Mark them honestly
+                // unbound instead of displaying shortcuts that cannot run.
+                ("jump_workspace_5", ""),
+                ("jump_workspace_9", ""),
                 // `w` opens the jump palette (tmux's choose-window / -tree); the
                 // scope chips inside narrow it to tabs, workspaces, or agents.
                 ("switcher", "w"),
@@ -714,11 +758,18 @@ pub fn presets() -> &'static [Preset] {
 impl App {
     /// The key currently bound to `cmd` (override or default), for display.
     pub fn key_for(&self, cmd: Cmd) -> String {
-        self.config
+        let key = self
+            .config
             .keybindings
             .get(cmd.id())
             .cloned()
-            .unwrap_or_else(|| cmd.default_key().to_string())
+            .unwrap_or_else(|| cmd.default_key().to_string());
+        if let Cmd::JumpWorkspace(position) = cmd {
+            if key == SHIFTED_DIGIT_KEYS[workspace_jump_index(position)] {
+                return format!("Shift+{}", workspace_jump_index(position) + 1);
+            }
+        }
+        key
     }
 
     /// Rebind `cmd` to `key`, persist, and rebuild the active keymap. If `key`
@@ -832,6 +883,16 @@ impl App {
             }
             Cmd::NextWorkspace => self.cycle_workspace(1),
             Cmd::PrevWorkspace => self.cycle_workspace(-1),
+            Cmd::JumpWorkspace(position) => {
+                let Some(index) = position.checked_sub(1).filter(|&index| index < 9) else {
+                    return;
+                };
+                if let Some(&(workspace, _)) =
+                    self.workspace_display_order().get(usize::from(index))
+                {
+                    self.active_ws = workspace;
+                }
+            }
             Cmd::NewWorktree => self.open_worktree_prompt(),
             Cmd::OpenGit => self.open_git_tab_active(),
             Cmd::OpenDiff => self.focus_diff_list(),
@@ -906,10 +967,101 @@ mod tests {
         assert_eq!(m.get("i"), Some(&Cmd::OpenDiff));
         assert_eq!(m.get("m"), Some(&Cmd::OpenMission));
         assert_eq!(m.get("M"), Some(&Cmd::Switcher));
-        // every command is reachable by its default key
+        // Every command is reachable by at least one default binding.
         for &c in Cmd::ALL {
-            assert!(m.values().any(|v| *v == c), "{c:?} bound");
+            assert!(m.values().any(|v| *v == c), "{c:?} default binding");
         }
+    }
+
+    #[test]
+    fn workspace_jump_ids_are_stable_and_rebindable() {
+        let mut overrides = HashMap::new();
+        let defaults = ["!", "@", "#", "$", "%", "^", "&", "*", "("];
+        for (position, default) in (1..=9).zip(defaults) {
+            let command = Cmd::JumpWorkspace(position);
+            assert_eq!(command.id(), format!("jump_workspace_{position}"));
+            assert_eq!(command.default_keys(), vec![default]);
+        }
+
+        overrides.insert("jump_workspace_4".into(), "u".into());
+        assert_eq!(
+            build_keymap(&overrides).get("u"),
+            Some(&Cmd::JumpWorkspace(4))
+        );
+        assert!(!build_keymap(&overrides).contains_key("$"));
+
+        overrides.insert("jump_workspace_4".into(), String::new());
+        assert!(!build_keymap(&overrides)
+            .values()
+            .any(|command| *command == Cmd::JumpWorkspace(4)));
+    }
+
+    #[test]
+    fn workspace_jump_defaults_use_chord_labels_only_for_display() {
+        let _env = crate::persist::test_env("workspace-jump-display-labels");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+
+        for position in 1..=9 {
+            assert_eq!(
+                app.key_for(Cmd::JumpWorkspace(position)),
+                format!("Shift+{position}")
+            );
+        }
+
+        app.config
+            .keybindings
+            .insert("jump_workspace_1".into(), "u".into());
+        app.config
+            .keybindings
+            .insert("jump_workspace_2".into(), String::new());
+        assert_eq!(app.key_for(Cmd::JumpWorkspace(1)), "u");
+        assert_eq!(app.key_for(Cmd::JumpWorkspace(2)), "");
+    }
+
+    #[test]
+    fn workspace_jump_uses_sidebar_order_and_preserves_target_focus() {
+        let _env = crate::persist::test_env("jump-workspace-display-order");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let focus = app.layout().focus;
+        for position in 2..=3 {
+            app.workspaces.push(Workspace {
+                id: crate::ids::public_id("workspace"),
+                name: format!("workspace-{position}"),
+                cwd: std::path::PathBuf::from(format!("/tmp/workspace-{position}")),
+                branch: None,
+                git_ahead_behind: None,
+                worktree: None,
+                tabs: vec![Tab::panes(TileLayout::new(focus))],
+                active_tab: 0,
+                pinned: position == 3,
+            });
+        }
+        app.workspaces[2]
+            .tabs
+            .push(Tab::panes(TileLayout::new(focus)));
+        app.workspaces[2].active_tab = 1;
+
+        assert_eq!(
+            app.workspace_display_order(),
+            vec![(2, false), (0, false), (1, false)]
+        );
+        app.run_cmd(Cmd::JumpWorkspace(1));
+        assert_eq!(app.active_ws, 2, "position resolves through sidebar order");
+        assert_eq!(app.ws().active_tab, 1, "target active tab is preserved");
+        assert_eq!(
+            app.layout().focus,
+            focus,
+            "target focused pane is preserved"
+        );
+
+        app.run_cmd(Cmd::JumpWorkspace(9));
+        assert_eq!(app.active_ws, 2, "an unavailable position is a no-op");
+        app.run_cmd(Cmd::JumpWorkspace(0));
+        assert_eq!(app.active_ws, 2, "position zero is a no-op");
+        app.run_cmd(Cmd::JumpWorkspace(10));
+        assert_eq!(app.active_ws, 2, "an unsupported position is a no-op");
     }
 
     #[test]
@@ -1213,6 +1365,12 @@ mod tests {
         assert_eq!(app.keymap.get(","), Some(&Cmd::RenameTab));
         assert_eq!(app.keymap.get(")"), Some(&Cmd::NextWorkspace));
         assert_eq!(app.keymap.get("("), Some(&Cmd::PrevWorkspace));
+        assert!(app.key_for(Cmd::JumpWorkspace(5)).is_empty());
+        assert!(app.key_for(Cmd::JumpWorkspace(9)).is_empty());
+        assert!(!app
+            .keymap
+            .values()
+            .any(|command| matches!(command, Cmd::JumpWorkspace(5 | 9))));
         // The default split keys are gone under the preset.
         assert_ne!(app.keymap.get("v"), Some(&Cmd::SplitRight));
         // `default` restores luvus's own prefix and keys.

@@ -23,7 +23,7 @@ the live cheat-sheet. Remap anything, change the prefix, or apply a preset in
 | `M` | jump palette (tabs / workspaces / agents) | `/` | global fuzzy finder |
 | `t` | named sessions | `=` | Settings |
 | `q` / `d` | detach | | |
-| `1`–`9` | jump to tab | | |
+| `1`–`9` | jump to tab | `Shift+1`–`Shift+9` | jump to workspace |
 
 ## The prefix and presets
 
@@ -66,6 +66,33 @@ same as tmux's rename-window), and Settings lives on `=`. The **Menu** button
 **workspace**, and every **agent** in one overlay. Type to filter, and use the
 scope chips (or `Tab`) to narrow it to one category. Arrows move, `Enter` jumps,
 `Esc` clears the filter then closes.
+
+## Jump directly to a workspace
+
+`Shift+1` through `Shift+9` jump directly to workspaces 1 through 9. The number
+follows the current WORKSPACES sidebar display order, including pinned
+workspaces and grouped worktrees. A position that is not currently available
+does nothing.
+
+The stable configuration ids are `jump_workspace_1` through
+`jump_workspace_9`. For example:
+
+```json
+{
+  "keybindings": {
+    "jump_workspace_1": "u",
+    "jump_workspace_2": ""
+  }
+}
+```
+
+Settings → Keys exposes each action separately, so users whose keyboard layout
+or terminal reports shifted number keys differently can rebind or disable them.
+The example above rebinds workspace 1 to `u` and disables workspace 2.
+
+The tmux preset reserves `%` and `(` for split-right and previous-workspace,
+which conflict with the terminal symbols for `Shift+5` and `Shift+9`. Those two
+direct workspace jumps are therefore unbound under that preset until reassigned.
 
 ## The global fuzzy finder
 

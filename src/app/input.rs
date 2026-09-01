@@ -3526,10 +3526,15 @@ impl App {
                     }
                     return true; // left prefix mode → the status bar updates
                 }
-                // Fixed convenience keys (not rebindable): `1`–`9` jump to a tab,
-                // `?` opens the shortcut cheat-sheet.
+                // Fixed convenience keys (not rebindable): unshifted `1`–`9`
+                // jump to a tab, and `?` opens the shortcut cheat-sheet. Shifted
+                // digits continue to the configurable command map below, where
+                // their normalized number-row symbols select workspaces.
                 if let KeyCode::Char(c) = key.code {
-                    if c.is_ascii_digit() && c != '0' {
+                    if c.is_ascii_digit()
+                        && c != '0'
+                        && !key.modifiers.contains(KeyModifiers::SHIFT)
+                    {
                         self.switch_tab(c as usize - '1' as usize);
                         return true;
                     }
@@ -3557,9 +3562,8 @@ impl App {
                 }
                 // Everything else resolves through the keybinding registry
                 // (defaults + user overrides; see `app/keys.rs`). `key_string`
-                // ignores modifiers, so the command key works whether you
-                // released Ctrl after the prefix (`Ctrl+Space` then `c`) or kept
-                // it held as a fast chord (`Ctrl+Space`+`Ctrl+c`).
+                // ignores held Ctrl/Alt and normalizes shifted digits, so both
+                // two-step and held-chord input resolve to the configured key.
                 if let Some(cmd) = keys::key_string(&key).and_then(|s| self.keymap.get(&s).copied())
                 {
                     self.run_cmd(cmd);
@@ -3930,6 +3934,58 @@ fn csi_tilde_key(code: u8, modifiers: KeyModifiers) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefix_digits_jump_to_tabs_and_shifted_digits_jump_to_workspaces() {
+        let _env = crate::persist::test_env("prefix-shifted-workspace-jump");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        let focus = app.layout().focus;
+        for position in 2..=9 {
+            app.workspaces[0]
+                .tabs
+                .push(Tab::panes(TileLayout::new(focus)));
+            app.workspaces.push(Workspace {
+                id: crate::ids::public_id("workspace"),
+                name: format!("workspace-{position}"),
+                cwd: std::path::PathBuf::from(format!("/tmp/workspace-{position}")),
+                branch: None,
+                git_ahead_behind: None,
+                worktree: None,
+                tabs: vec![Tab::panes(TileLayout::new(focus))],
+                active_tab: 0,
+                pinned: false,
+            });
+        }
+
+        let prefix = || AppEvent::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL));
+        let shifted = ['!', '@', '#', '$', '%', '^', '&', '*', '('];
+        for (index, (digit, symbol)) in ('1'..='9').zip(shifted).enumerate() {
+            app.active_ws = 0;
+            app.handle_event(prefix());
+            app.handle_event(AppEvent::Key(KeyEvent::new(
+                KeyCode::Char(digit),
+                KeyModifiers::NONE,
+            )));
+            assert_eq!(app.active_ws, 0, "plain digit stays in the workspace");
+            assert_eq!(app.ws().active_tab, index, "plain digit jumps to a tab");
+
+            // Unix legacy input reports the shifted symbol without modifiers,
+            // Windows retains Shift on that symbol, and enhanced Unix input
+            // reports the base digit with Shift. All three travel through the
+            // real prefix path and resolve to the same configurable action.
+            for key in [
+                KeyEvent::new(KeyCode::Char(symbol), KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Char(symbol), KeyModifiers::SHIFT),
+                KeyEvent::new(KeyCode::Char(digit), KeyModifiers::SHIFT),
+            ] {
+                app.active_ws = usize::from(index == 0);
+                app.handle_event(prefix());
+                app.handle_event(AppEvent::Key(key));
+                assert_eq!(app.active_ws, index, "{key:?} jumps to workspace");
+            }
+        }
+    }
 
     #[test]
     fn command_inspect_fills_only_a_missing_process_root() {
