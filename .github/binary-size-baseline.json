@@ -6,24 +6,24 @@
   },
   "targets": {
     "aarch64-apple-darwin": {
-      "executable_bytes": 8181312,
-      "archive_bytes": 3529490
+      "executable_bytes": 8741072,
+      "archive_bytes": 3781053
     },
     "x86_64-apple-darwin": {
-      "executable_bytes": 8043516,
-      "archive_bytes": 3431185
+      "executable_bytes": 9550124,
+      "archive_bytes": 4031584
     },
     "aarch64-unknown-linux-musl": {
-      "executable_bytes": 9075944,
-      "archive_bytes": 4233398
+      "executable_bytes": 10345896,
+      "archive_bytes": 4779731
     },
     "x86_64-unknown-linux-musl": {
-      "executable_bytes": 10571024,
-      "archive_bytes": 4561370
+      "executable_bytes": 12213712,
+      "archive_bytes": 5157914
     },
     "x86_64-pc-windows-msvc": {
-      "executable_bytes": 11894272,
-      "archive_bytes": 4376756
+      "executable_bytes": 13441536,
+      "archive_bytes": 4915845
     }
   }
 }
