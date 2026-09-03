@@ -428,13 +428,14 @@ fn builtin_rules() -> Vec<Rule> {
             Region::Screen,
             vec![any(&["ctrl+c to stop"])],
         ),
-        // OMP 18.x publishes its state in the OSC title as `π <state> label`.
-        // The working separator is a non-blank braille spinner, while `!` means
-        // attention and `>` means the user's turn. Keep these rules scoped to
-        // OMP: the generic spinner rule deliberately requires a spinner at the
-        // start of a line, and weakening it would create false positives for
-        // ordinary branded titles. The explicit idle title outranks retained
-        // screen activity but not a live confirmation panel.
+        // OMP publishes its state in the OSC title as `π <state> label`.
+        // Current builds use `:` while working, `!` for attention, and `>` for
+        // the user's turn. Older builds animated a braille spinner after `π `
+        // instead of `:`; keep that form so both contracts classify. Scope the
+        // rules to OMP: the generic spinner rule requires a line-leading
+        // spinner, and weakening it would create false positives for ordinary
+        // branded titles. The explicit idle title outranks retained screen
+        // activity but not a live confirmation panel.
         per(
             "omp",
             State::Blocked,
@@ -446,6 +447,13 @@ fn builtin_rules() -> Vec<Rule> {
             "omp",
             State::Working,
             125,
+            Region::Title,
+            vec![starts_with(&["π :"])],
+        ),
+        per(
+            "omp",
+            State::Working,
+            124,
             Region::Title,
             vec![spinner_after_prefix(&["π "])],
         ),
@@ -1681,12 +1689,13 @@ Would you like to proceed?
             )
         };
 
-        let working = detect("π ⠋ sudos", "");
+        let working = detect("π : sudos", "");
         assert_eq!(working.agent, "omp");
         assert_eq!(working.identity_source, "process_tree");
         assert_eq!(working.state, State::Working);
         assert_eq!(working.state_source, "manifest_rule");
 
+        assert_eq!(detect("π ⠋ sudos", "").state, State::Working);
         assert_eq!(detect("π ! sudos", "").state, State::Blocked);
         assert_eq!(detect("π > sudos", "esc to interrupt").state, State::Idle);
 
