@@ -1706,7 +1706,10 @@ Would you like to proceed?
         // Windows ConPTY-mangled brand observed in live inventory titles.
         assert_eq!(detect("\u{87FA} : sudos", "").state, State::Working);
         assert_eq!(detect("\u{87FA} ! sudos", "").state, State::Blocked);
-        assert_eq!(detect("\u{87FA} > sudos", "esc to interrupt").state, State::Idle);
+        assert_eq!(
+            detect("\u{87FA} > sudos", "esc to interrupt").state,
+            State::Idle
+        );
 
         let pi = classify(
             Some("π ⠙ sudos"),
